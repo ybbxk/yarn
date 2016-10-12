@@ -556,6 +556,32 @@ test.concurrent('install should resolve circular dependencies 2', (): Promise<vo
   });
 });
 
+test.concurrent('install should resolve circular dependencies 2', (): Promise<void> => {
+  return runInstall({}, 'install-should-circumvent-circular-dependencies-2', async (config, reporter) => {
+    assert.equal(
+      await getPackageVersion(config, 'es5-ext'),
+      '0.10.12',
+    );
+  });
+});
+
+test.concurrent('install should be idempotent', (): Promise<void> => {
+  // Install a package twice
+  runInstall({}, 'install-should-be-idempotent', async (config, reporter) => {
+    assert.equal(
+      await getPackageVersion(config, 'dep-a'),
+      '1.0.0',
+    );
+  }, null, false);
+
+  return runInstall({}, 'install-should-be-idempotent', async (config, reporter) => {
+    assert.equal(
+      await getPackageVersion(config, 'dep-a'),
+      '1.0.0',
+    );
+  });
+});
+
 test.concurrent(
   'install should add missing deps to yarn and mirror (PR import scenario)',
   (): Promise<void> => {
