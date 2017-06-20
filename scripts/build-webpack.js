@@ -18,30 +18,29 @@ const compiler = webpack({
   // devtool: 'inline-source-map',
   entry: [path.join(basedir, 'src/cli/index.js')],
   module: {
-    loaders: [{
-      test: /\.js$/,
-      exclude: /node_modules/,
-      loader: 'babel',
-    }, {
-      test: /\.json$/,
-      loader: 'json',
-    }],
+    loaders: [
+      {
+        test: /\.js$/,
+        exclude: /node_modules/,
+        loader: 'babel-loader',
+      },
+    ],
   },
   plugins: [
     new webpack.BannerPlugin({
-      banner: "#!/usr/bin/env node",
-      raw: true
-    })
+      banner: '#!/usr/bin/env node',
+      raw: true,
+    }),
   ],
   output: {
     filename: `yarn-${version}.js`,
-    path: path.join(basedir, 'dist'),
+    path: path.join(basedir, 'artifacts'),
   },
   target: 'node',
 });
 
 compiler.run((err, stats) => {
-  const {fileDependencies} = stats.compilation;
+  const fileDependencies = stats.compilation.fileDependencies;
   const filenames = fileDependencies.map(x => x.replace(basedir, ''));
   console.log(util.inspect(filenames, {maxArrayLength: null}));
 });
@@ -54,25 +53,24 @@ const compilerLegacy = webpack({
   // devtool: 'inline-source-map',
   entry: [path.join(basedir, 'src/cli/index.js')],
   module: {
-    loaders: [{
-      test: /\.js$/,
-      exclude: /node_modules/,
-      loader: 'babel',
-      query: babelRc.env['pre-node5'],
-    }, {
-      test: /\.json$/,
-      loader: 'json',
-    }],
+    loaders: [
+      {
+        test: /\.js$/,
+        exclude: /node_modules/,
+        loader: 'babel-loader',
+        query: babelRc.env['pre-node5'],
+      },
+    ],
   },
   plugins: [
     new webpack.BannerPlugin({
-      banner: "#!/usr/bin/env node",
-      raw: true
-    })
+      banner: '#!/usr/bin/env node',
+      raw: true,
+    }),
   ],
   output: {
     filename: `yarn-legacy-${version}.js`,
-    path: path.join(basedir, 'dist'),
+    path: path.join(basedir, 'artifacts'),
   },
   target: 'node',
 });

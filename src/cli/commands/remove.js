@@ -2,7 +2,6 @@
 
 import type {Reporter} from '../../reporters/index.js';
 import type Config from '../../config.js';
-import {execFromManifest} from './_execute-lifecycle-script.js';
 import Lockfile from '../../lockfile/wrapper.js';
 import {registries} from '../../registries/index.js';
 import {Install} from './install.js';
@@ -15,12 +14,13 @@ const path = require('path');
 
 export const requireLockfile = true;
 
-export async function run(
-  config: Config,
-  reporter: Reporter,
-  flags: Object,
-  args: Array<string>,
-): Promise<void> {
+export function setFlags() {}
+
+export function hasWrapper(): boolean {
+  return true;
+}
+
+export async function run(config: Config, reporter: Reporter, flags: Object, args: Array<string>): Promise<void> {
   if (!args.length) {
     throw new MessageError(reporter.lang('tooFewArguments', 1));
   }
@@ -44,7 +44,7 @@ export async function run(
 
       for (const type of constants.DEPENDENCY_TYPES) {
         const deps = object[type];
-        if (deps) {
+        if (deps && deps[name]) {
           found = true;
           delete deps[name];
         }
@@ -52,10 +52,7 @@ export async function run(
 
       const possibleManifestLoc = path.join(config.cwd, registry.folder, name);
       if (await fs.exists(possibleManifestLoc)) {
-        manifests.push([
-          possibleManifestLoc,
-          await config.readManifest(possibleManifestLoc, registryName),
-        ]);
+        manifests.push([possibleManifestLoc, await config.readManifest(possibleManifestLoc, registryName)]);
       }
     }
 
@@ -69,8 +66,8 @@ export async function run(
 
   // run hooks - npm runs these one after another
   for (const action of ['preuninstall', 'uninstall', 'postuninstall']) {
-    for (const [loc, manifest] of manifests) {
-      await execFromManifest(config, action, manifest, loc);
+    for (const [loc] of manifests) {
+      await config.executeLifecycleScript(action, loc);
     }
   }
 

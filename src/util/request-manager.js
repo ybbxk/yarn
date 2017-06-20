@@ -41,24 +41,26 @@ type RequestParams<T> = {
   proxy?: string,
   encoding?: ?string,
   ca?: Array<string>,
+  cert?: string,
+  networkConcurrency?: number,
+  timeout?: number,
+  key?: string,
   forever?: boolean,
   strictSSL?: boolean,
   headers?: {
-    [name: string]: string
+    [name: string]: string,
   },
-  process?: (
-    req: RequestT,
-    resolve: (body: T) => void,
-    reject: (err: Error) => void
-  ) => void,
+  process?: (req: RequestT, resolve: (body: T) => void, reject: (err: Error) => void) => void,
   callback?: (err: ?Error, res: any, body: any) => void,
-  retryAttempts?: number
+  retryAttempts?: number,
+  maxRetryAttempts?: number,
+  followRedirect?: boolean,
 };
 
 type RequestOptions = {
   params: RequestParams<Object>,
   resolve: (body: any) => void,
-  reject: (err: any) => void
+  reject: (err: any) => void,
 };
 
 export default class RequestManager {
@@ -78,6 +80,7 @@ export default class RequestManager {
     this.queue = [];
     this.cache = {};
     this.max = constants.NETWORK_CONCURRENCY;
+    this.maxRetryAttempts = 5;
   }
 
   offlineNoRequests: boolean;
@@ -89,11 +92,15 @@ export default class RequestManager {
   httpProxy: ?string;
   strictSSL: boolean;
   ca: ?Array<string>;
+  cert: ?string;
+  key: ?string;
   offlineQueue: Array<RequestOptions>;
   queue: Array<Object>;
   max: number;
+  timeout: number;
+  maxRetryAttempts: number;
   cache: {
-    [key: string]: Promise<any>
+    [key: string]: Promise<any>,
   };
 
   _requestCaptureHar: ?RequestCaptureHar;
@@ -106,7 +113,13 @@ export default class RequestManager {
     httpProxy?: string,
     httpsProxy?: string,
     strictSSL?: boolean,
+    ca?: Array<string>,
     cafile?: string,
+    cert?: string,
+    networkConcurrency?: number,
+    networkTimeout?: number,
+    maxRetryAttempts?: number,
+    key?: string,
   }) {
     if (opts.userAgent != null) {
       this.userAgent = opts.userAgent;
@@ -132,17 +145,42 @@ export default class RequestManager {
       this.strictSSL = opts.strictSSL;
     }
 
+    if (opts.ca != null && opts.ca.length > 0) {
+      this.ca = opts.ca;
+    }
+
+    if (opts.networkConcurrency != null) {
+      this.max = opts.networkConcurrency;
+    }
+
+    if (opts.networkTimeout != null) {
+      this.timeout = opts.networkTimeout;
+    }
+
+    if (opts.maxRetryAttempts != null) {
+      this.maxRetryAttempts = opts.maxRetryAttempts;
+    }
+
     if (opts.cafile != null && opts.cafile != '') {
       // The CA bundle file can contain one or more certificates with comments/text between each PEM block.
       // tls.connect wants an array of certificates without any comments/text, so we need to split the string
       // and strip out any text in between the certificates
       try {
         const bundle = fs.readFileSync(opts.cafile).toString();
-        const hasPemPrefix = (block) => block.startsWith('-----BEGIN ');
+        const hasPemPrefix = block => block.startsWith('-----BEGIN ');
+        // opts.cafile overrides opts.ca, this matches with npm behavior
         this.ca = bundle.split(/(-----BEGIN .*\r?\n[^-]+\r?\n--.*)/).filter(hasPemPrefix);
       } catch (err) {
         this.reporter.error(`Could not open cafile: ${err.message}`);
       }
+    }
+
+    if (opts.cert != null) {
+      this.cert = opts.cert;
+    }
+
+    if (opts.key != null) {
+      this.key = opts.key;
     }
   }
 
@@ -170,7 +208,7 @@ export default class RequestManager {
 
   request<T>(params: RequestParams<T>): Promise<T> {
     if (this.offlineNoRequests) {
-      return Promise.reject(new MessageError("Can't make a request in offline mode"));
+      return Promise.reject(new MessageError(this.reporter.lang('cantRequestOffline', params.url)));
     }
 
     const cached = this.cache[params.url];
@@ -182,13 +220,15 @@ export default class RequestManager {
     params.forever = true;
     params.retryAttempts = 0;
     params.strictSSL = this.strictSSL;
-    
-    params.headers = Object.assign({
-      'User-Agent': this.userAgent,
-    }, params.headers);
+    params.headers = Object.assign(
+      {
+        'User-Agent': this.userAgent,
+      },
+      params.headers,
+    );
 
     const promise = new Promise((resolve, reject) => {
-      this.queue.push({params, resolve, reject});
+      this.queue.push({params, reject, resolve});
       this.shiftQueue();
     });
 
@@ -245,6 +285,11 @@ export default class RequestManager {
       return true;
     }
 
+    // TCP timeout
+    if (code === 'ESOCKETTIMEDOUT') {
+      return true;
+    }
+
     return false;
   }
 
@@ -283,8 +328,9 @@ export default class RequestManager {
 
   execute(opts: RequestOptions) {
     const {params} = opts;
+    const {reporter} = this;
 
-    const buildNext = (fn) => (data) => {
+    const buildNext = fn => data => {
       fn(data);
       this.running--;
       this.shiftQueue();
@@ -298,16 +344,15 @@ export default class RequestManager {
       rejectNext(err);
     };
 
-    //
     let calledOnError = false;
-    const onError = (err) => {
+    const onError = err => {
       if (calledOnError) {
         return;
       }
       calledOnError = true;
 
       const attempts = params.retryAttempts || 0;
-      if (attempts < 5 && this.isPossibleOfflineError(err)) {
+      if (attempts < this.maxRetryAttempts - 1 && this.isPossibleOfflineError(err)) {
         params.retryAttempts = attempts + 1;
         if (typeof params.cleanup === 'function') {
           params.cleanup();
@@ -321,7 +366,7 @@ export default class RequestManager {
     if (!params.process) {
       const parts = url.parse(params.url);
 
-      params.callback = function(err, res, body) {
+      params.callback = (err, res, body) => {
         if (err) {
           onError(err);
           return;
@@ -329,16 +374,18 @@ export default class RequestManager {
 
         successHosts[parts.hostname] = true;
 
+        this.reporter.verbose(this.reporter.lang('verboseRequestFinish', params.url, res.statusCode));
+
         if (body && typeof body.error === 'string') {
           reject(new Error(body.error));
           return;
         }
 
         if (res.statusCode === 403) {
-          const errMsg = (body && body.message) || `Request ${params.url} returned a ${res.statusCode}`;
+          const errMsg = (body && body.message) || reporter.lang('requestError', params.url, res.statusCode);
           reject(new Error(errMsg));
         } else {
-          if (res.statusCode === 400 || res.statusCode === 404) {
+          if (res.statusCode === 400 || res.statusCode === 404 || res.statusCode === 401) {
             body = false;
           }
           resolve(body);
@@ -362,8 +409,21 @@ export default class RequestManager {
       params.ca = this.ca;
     }
 
+    if (this.cert != null) {
+      params.cert = this.cert;
+    }
+
+    if (this.key != null) {
+      params.key = this.key;
+    }
+
+    if (this.timeout != null) {
+      params.timeout = this.timeout;
+    }
+
     const request = this._getRequestModule();
     const req = request(params);
+    this.reporter.verbose(this.reporter.lang('verboseRequestStart', params.method, params.url));
 
     req.on('error', onError);
 
@@ -394,9 +454,9 @@ export default class RequestManager {
 
   saveHar(filename: string) {
     if (!this.captureHar) {
-      throw new Error('RequestManager was not setup to capture HAR files');
+      throw new Error(this.reporter.lang('requestManagerNotSetupHAR'));
     }
-    // No request may have occured at all.
+    // No request may have occurred at all.
     this._getRequestModule();
     invariant(this._requestCaptureHar != null, 'request-capture-har not setup');
     this._requestCaptureHar.saveHar(filename);

@@ -13,7 +13,9 @@ type Parts = Array<string>;
 let historyCounter = 0;
 
 export class HoistManifest {
-  constructor(key: string, parts: Parts, pkg: Manifest, loc: string) {
+  constructor(key: string, parts: Parts, pkg: Manifest, loc: string, isRequired: boolean, isIncompatible: boolean) {
+    this.isRequired = isRequired;
+    this.isIncompatible = isIncompatible;
     this.loc = loc;
     this.pkg = pkg;
 
@@ -26,6 +28,8 @@ export class HoistManifest {
     this.addHistory(`Start position = ${key}`);
   }
 
+  isRequired: boolean;
+  isIncompatible: boolean;
   pkg: Manifest;
   loc: string;
   parts: Parts;
@@ -40,8 +44,7 @@ export class HoistManifest {
 }
 
 export default class PackageHoister {
-  constructor(config: Config, resolver: PackageResolver, ignoreOptional: boolean) {
-    this.ignoreOptional = ignoreOptional;
+  constructor(config: Config, resolver: PackageResolver) {
     this.resolver = resolver;
     this.config = config;
 
@@ -50,7 +53,6 @@ export default class PackageHoister {
     this.tree = new Map();
   }
 
-  ignoreOptional: boolean;
   resolver: PackageResolver;
   config: Config;
 
@@ -85,13 +87,16 @@ export default class PackageHoister {
    */
 
   seed(patterns: Array<string>) {
+    this.prepass(patterns);
+
     for (const pattern of this.resolver.dedupePatterns(patterns)) {
-      this._seed(pattern);
+      this._seed(pattern, {isDirectRequire: true});
     }
 
     while (true) {
       let queue = this.levelQueue;
       if (!queue.length) {
+        this._propagateRequired();
         return;
       }
 
@@ -104,8 +109,8 @@ export default class PackageHoister {
 
       //
       const infos = [];
-      for (const [pattern, parents] of queue) {
-        const info = this._seed(pattern, parents);
+      for (const [pattern, parent] of queue) {
+        const info = this._seed(pattern, {isDirectRequire: false, parent});
         if (info) {
           infos.push(info);
         }
@@ -122,26 +127,37 @@ export default class PackageHoister {
    * Seed the hoister with a specific pattern.
    */
 
-  _seed(pattern: string, parent?: HoistManifest): ?HoistManifest {
-    let parentParts: Parts = [];
-
-    if (parent) {
-      if (!this.tree.get(parent.key)) {
-        return null;
-      }
-      parentParts = parent.parts;
-    }
-
+  _seed(
+    pattern: string,
+    {isDirectRequire, parent}: {isDirectRequire: boolean, parent?: HoistManifest},
+  ): ?HoistManifest {
     //
     const pkg = this.resolver.getStrictResolvedPattern(pattern);
     const ref = pkg._reference;
     invariant(ref, 'expected reference');
 
     //
+    let parentParts: Parts = [];
+    const isIncompatible = ref.incompatible;
+    let isRequired = isDirectRequire && !ref.ignore && !isIncompatible;
+
+    if (parent) {
+      if (!this.tree.get(parent.key)) {
+        return null;
+      }
+      // non ignored dependencies inherit parent's ignored status
+      // parent may transition from ignored to non ignored when hoisted if it is used in another non ignored branch
+      if (!isDirectRequire && !isIncompatible && parent.isRequired) {
+        isRequired = true;
+      }
+      parentParts = parent.parts;
+    }
+
+    //
     const loc: string = this.config.generateHardModulePath(ref);
     const parts = parentParts.concat(pkg.name);
     const key: string = this.implodeKey(parts);
-    const info: HoistManifest = new HoistManifest(key, parts, pkg, loc);
+    const info: HoistManifest = new HoistManifest(key, parts, pkg, loc, isRequired, isIncompatible);
 
     //
     this.tree.set(key, info);
@@ -156,10 +172,69 @@ export default class PackageHoister {
   }
 
   /**
+   * Propagate inherited ignore statuses from non-ignored to ignored packages
+  */
+
+  _propagateRequired() {
+    //
+    const toVisit: Array<HoistManifest> = [];
+
+    // enumerate all non-ignored packages
+    for (const entry of this.tree.entries()) {
+      if (entry[1].isRequired) {
+        toVisit.push(entry[1]);
+      }
+    }
+
+    // visit them
+    while (toVisit.length) {
+      const info = toVisit.shift();
+      const ref = info.pkg._reference;
+      invariant(ref, 'expected reference');
+
+      for (const depPattern of ref.dependencies) {
+        const depinfo = this._lookupDependency(info, depPattern);
+        if (depinfo && !depinfo.isRequired && !depinfo.isIncompatible) {
+          depinfo.isRequired = true;
+          depinfo.addHistory(`Mark as non-ignored because of usage by ${info.key}`);
+          toVisit.push(depinfo);
+        }
+      }
+    }
+  }
+
+  /**
+   * Looks up the package a dependency resolves to
+  */
+
+  _lookupDependency(info: HoistManifest, depPattern: string): ?HoistManifest {
+    //
+    const pkg = this.resolver.getStrictResolvedPattern(depPattern);
+    const ref = pkg._reference;
+    invariant(ref, 'expected reference');
+
+    //
+    for (let i = info.parts.length; i >= 0; i--) {
+      const checkParts = info.parts.slice(0, i).concat(pkg.name);
+      const checkKey = this.implodeKey(checkParts);
+      const existing = this.tree.get(checkKey);
+      if (existing) {
+        return existing;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Find the highest position we can hoist this module to.
    */
 
-  getNewParts(key: string, info: HoistManifest, parts: Parts): {
+  getNewParts(
+    key: string,
+    info: HoistManifest,
+    parts: Parts,
+  ): {
     parts: Parts,
     duplicate: boolean,
   } {
@@ -178,7 +253,14 @@ export default class PackageHoister {
       const existing = this.tree.get(checkKey);
       if (existing) {
         if (existing.loc === info.loc) {
-          existing.addHistory(`Deduped ${fullKey} to this item`);
+          // switch to non ignored if earlier deduped version was ignored (must be compatible)
+          if (!existing.isRequired && info.isRequired) {
+            existing.addHistory(`Deduped ${fullKey} to this item, marking as required`);
+            existing.isRequired = true;
+          } else {
+            existing.addHistory(`Deduped ${fullKey} to this item`);
+          }
+
           return {parts: checkParts, duplicate: true};
         } else {
           // everything above will be shadowed and this is a conflict
@@ -269,7 +351,6 @@ export default class PackageHoister {
     // remove this item from the `tree` map so we can ignore it
     this.tree.delete(key);
 
-    //
     const {parts, duplicate} = this.getNewParts(key, info, rawParts.slice());
     const newKey = this.implodeKey(parts);
     const oldKey = key;
@@ -295,11 +376,7 @@ export default class PackageHoister {
    * Declare that a module has been hoisted and update our internal references.
    */
 
-  declareRename(
-    info: HoistManifest,
-    oldParts: Array<string>,
-    newParts: Array<string>,
-  ) {
+  declareRename(info: HoistManifest, oldParts: Array<string>, newParts: Array<string>) {
     // go down the tree from our new position reserving our name
     this.taintParents(info, oldParts.slice(0, -1), newParts.length - 1);
   }
@@ -339,17 +416,109 @@ export default class PackageHoister {
   }
 
   /**
+   * Perform a prepass and if there's multiple versions of the same package, hoist the one with
+   * the most dependents to the top.
+   */
+
+  prepass(patterns: Array<string>) {
+    patterns = this.resolver.dedupePatterns(patterns).sort();
+
+    const occurences: {
+      [packageName: string]: {
+        [version: string]: {
+          pattern: string,
+          occurences: Set<Manifest>,
+        },
+      },
+    } = {};
+
+    // add an occuring package to the above data structure
+    const add = (pattern: string, ancestry: Array<Manifest>) => {
+      const pkg = this.resolver.getStrictResolvedPattern(pattern);
+      if (ancestry.indexOf(pkg) >= 0) {
+        // prevent recursive dependencies
+        return;
+      }
+
+      const ref = pkg._reference;
+      invariant(ref, 'expected reference');
+
+      const versions = (occurences[pkg.name] = occurences[pkg.name] || {});
+      const version = (versions[pkg.version] = versions[pkg.version] || {
+        occurences: new Set(),
+        pattern,
+      });
+      version.occurences.add(ancestry[ancestry.length - 1]);
+
+      for (const depPattern of ref.dependencies) {
+        add(depPattern, ancestry.concat(pkg));
+      }
+    };
+
+    // get a list of root package names since we can't hoist other dependencies to these spots!
+    const rootPackageNames: Set<string> = new Set();
+    for (const pattern of patterns) {
+      const pkg = this.resolver.getStrictResolvedPattern(pattern);
+      rootPackageNames.add(pkg.name);
+    }
+
+    // seed occurences
+    for (const pattern of patterns) {
+      add(pattern, []);
+    }
+
+    for (const packageName of Object.keys(occurences).sort()) {
+      const versionOccurences = occurences[packageName];
+      const versions = Object.keys(versionOccurences);
+
+      if (versions.length === 1) {
+        // only one package type so we'll hoist this to the top anyway
+        continue;
+      }
+
+      if (this.tree.get(packageName)) {
+        // a transitive dependency of a previously hoisted dependency exists
+        continue;
+      }
+
+      if (rootPackageNames.has(packageName)) {
+        // can't replace top level packages
+        continue;
+      }
+
+      let mostOccurenceCount;
+      let mostOccurencePattern;
+      for (const version of Object.keys(versionOccurences).sort()) {
+        const {occurences, pattern} = versionOccurences[version];
+        const occurenceCount = occurences.size;
+
+        if (!mostOccurenceCount || occurenceCount > mostOccurenceCount) {
+          mostOccurenceCount = occurenceCount;
+          mostOccurencePattern = pattern;
+        }
+      }
+      invariant(mostOccurencePattern, 'expected most occuring pattern');
+      invariant(mostOccurenceCount, 'expected most occuring count');
+
+      // only hoist this module if it occured more than once
+      if (mostOccurenceCount > 1) {
+        this._seed(mostOccurencePattern, {isDirectRequire: false});
+      }
+    }
+  }
+
+  /**
    * Produce a flattened list of module locations and manifests.
    */
 
-  init(): Array<[string, HoistManifest]> {
+  init(): HoistManifestTuples {
     const flatTree = [];
 
     //
     for (const [key, info] of this.tree.entries()) {
       // decompress the location and push it to the flat tree. this path could be made
       // up of modules from different registries so we need to handle this specially
-      const parts = [];
+      const parts: Array<string> = [];
       const keyParts = key.split('#');
       for (let i = 0; i < keyParts.length; i++) {
         const key = keyParts.slice(0, i + 1).join('#');
@@ -362,14 +531,13 @@ export default class PackageHoister {
       if (this.config.modulesFolder) {
         // remove the first part which will be the folder name and replace it with a
         // hardcoded modules folder
-        parts.shift();
-        parts.unshift(this.config.modulesFolder);
+        parts.splice(0, 1, this.config.modulesFolder);
       } else {
         // first part will be the registry-specific module folder
-        parts.unshift(this.config.cwd);
+        parts.splice(0, 0, this.config.lockfileFolder);
       }
 
-      const loc = parts.join(path.sep);
+      const loc = path.join(...parts);
       flatTree.push([loc, info]);
     }
 
@@ -379,11 +547,7 @@ export default class PackageHoister {
       const ref = info.pkg._reference;
       invariant(ref, 'expected reference');
 
-      let ignored = ref.ignore;
-      if (ref.optional && this.ignoreOptional) {
-        ignored = true;
-      }
-      if (ignored) {
+      if (!info.isRequired) {
         info.addHistory('Deleted as this module was ignored');
       } else {
         visibleFlatTree.push([loc, info]);
@@ -392,3 +556,6 @@ export default class PackageHoister {
     return visibleFlatTree;
   }
 }
+
+export type HoistManifestTuple = [string, HoistManifest];
+export type HoistManifestTuples = Array<HoistManifestTuple>;

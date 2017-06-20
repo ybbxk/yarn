@@ -7,10 +7,7 @@ import typos from './typos.js';
 
 const isBuiltinModule = require('is-builtin-module');
 
-const strings = [
-  'name',
-  'version',
-];
+const strings = ['name', 'version'];
 
 const dependencyKeys = [
   // npm registry will include optionalDependencies in dependencies and we'll want to dedupe them from the
@@ -48,7 +45,7 @@ export default function(info: Object, isRoot: boolean, reporter: Reporter, warn:
   if (isRoot) {
     for (const key in typos) {
       if (key in info) {
-        warn(reporter.lang('manifestPotentialType', key, typos[key]));
+        warn(reporter.lang('manifestPotentialTypo', key, typos[key]));
       }
     }
   }
@@ -111,37 +108,37 @@ export function cleanDependencies(info: Object, isRoot: boolean, reporter: Repor
     depTypes.push([type, deps]);
   }
 
-  // check root dependencies for builtin module names
-  if (isRoot) {
-    for (const [type, deps] of depTypes) {
-      for (const name in deps) {
-        if (isBuiltinModule(name)) {
-          warn(reporter.lang('manifestDependencyBuiltin', name, type));
-        }
+  // aggregate all non-trivial deps (not '' or '*')
+  const nonTrivialDeps: Map<string, {type: string, version: string}> = new Map();
+  for (const [type, deps] of depTypes) {
+    for (const name of Object.keys(deps)) {
+      const version = deps[name];
+      if (!nonTrivialDeps.has(name) && version && version !== '*') {
+        nonTrivialDeps.set(name, {type, version});
       }
     }
   }
 
-  // ensure that dependencies don't have ones that can collide
+  // overwrite first dep of package with non-trivial version, remove the rest
+  const setDeps: Set<string> = new Set();
   for (const [type, deps] of depTypes) {
-    for (const name in deps) {
-      const version = deps[name];
+    for (const name of Object.keys(deps)) {
+      let version = deps[name];
 
-      // check collisions
-      for (const [type2, deps2] of depTypes) {
-        const version2 = deps2[name];
-        if (deps === deps2 || !version2 || version2 === '*') {
-          continue;
-        }
-
-        if (version !== version2 && isRoot) {
+      const dep = nonTrivialDeps.get(name);
+      if (dep) {
+        if (version && version !== '*' && version !== dep.version && isRoot) {
           // only throw a warning when at the root
-          warn(
-            reporter.lang('manifestDependencyCollision', type, name, version, type2, version2),
-          );
+          warn(reporter.lang('manifestDependencyCollision', dep.type, name, dep.version, type, version));
         }
+        version = dep.version;
+      }
 
-        delete deps2[name];
+      if (setDeps.has(name)) {
+        delete deps[name];
+      } else {
+        deps[name] = version;
+        setDeps.add(name);
       }
     }
   }

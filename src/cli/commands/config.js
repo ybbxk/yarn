@@ -5,17 +5,15 @@ import type {Reporter} from '../../reporters/index.js';
 import type Config from '../../config.js';
 import buildSubCommands from './_build-sub-commands.js';
 
-export const {run, setFlags} = buildSubCommands('config', {
-  async set(
-    config: Config,
-    reporter: Reporter,
-    flags: Object,
-    args: Array<string>,
-  ): Promise<boolean> {
+export function hasWrapper(flags: Object, args: Array<string>): boolean {
+  return args[0] !== 'get';
+}
+
+export const {run, setFlags, examples} = buildSubCommands('config', {
+  async set(config: Config, reporter: Reporter, flags: Object, args: Array<string>): Promise<boolean> {
     if (args.length === 0 || args.length > 2) {
       return false;
     }
-
     const [key, val = true] = args;
     const yarnConfig = config.registries.yarn;
     await yarnConfig.saveHomeConfig({[key]: val});
@@ -23,26 +21,16 @@ export const {run, setFlags} = buildSubCommands('config', {
     return true;
   },
 
-  get(
-    config: Config,
-    reporter: Reporter,
-    flags: Object,
-    args: Array<string>,
-  ): boolean {
+  get(config: Config, reporter: Reporter, flags: Object, args: Array<string>): boolean {
     if (args.length !== 1) {
       return false;
     }
 
-    reporter.log(String(config.getOption(args[0])));
+    reporter.log(String(config.getOption(args[0], false)));
     return true;
   },
 
-  delete: async function(
-    config: Config,
-    reporter: Reporter,
-    flags: Object,
-    args: Array<string>,
-  ): Promise<boolean> {
+  delete: async function(config: Config, reporter: Reporter, flags: Object, args: Array<string>): Promise<boolean> {
     if (args.length !== 1) {
       return false;
     }
@@ -54,12 +42,7 @@ export const {run, setFlags} = buildSubCommands('config', {
     return true;
   },
 
-  list(
-    config: Config,
-    reporter: Reporter,
-    flags: Object,
-    args: Array<string>,
-  ): boolean {
+  list(config: Config, reporter: Reporter, flags: Object, args: Array<string>): boolean {
     if (args.length) {
       return false;
     }
@@ -73,7 +56,3 @@ export const {run, setFlags} = buildSubCommands('config', {
     return true;
   },
 });
-
-export function hasWrapper(flags: Object, args: Array<string>): boolean {
-  return args[0] !== 'get';
-}

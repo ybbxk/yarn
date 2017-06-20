@@ -1,20 +1,19 @@
 /* @flow */
 
+import type {InstallationMethod} from '../../util/yarn-version.js';
 import type {Reporter} from '../../reporters/index.js';
 import type {ReporterSelectOption} from '../../reporters/types.js';
 import type {Manifest, DependencyRequestPatterns} from '../../types.js';
 import type Config from '../../config.js';
 import type {RegistryNames} from '../../registries/index.js';
 import normalizeManifest from '../../util/normalize-manifest/index.js';
-import {registryNames} from '../../registries/index.js';
 import {MessageError} from '../../errors.js';
+import InstallationIntegrityChecker from '../../integrity-checker.js';
 import Lockfile from '../../lockfile/wrapper.js';
-import executeLifecycleScript from './_execute-lifecycle-script.js';
 import lockStringify from '../../lockfile/stringify.js';
-import * as PackageReference from '../../package-reference.js';
-import PackageFetcher from '../../package-fetcher.js';
+import * as fetcher from '../../package-fetcher.js';
 import PackageInstallScripts from '../../package-install-scripts.js';
-import PackageCompatibility from '../../package-compatibility.js';
+import * as compatibility from '../../package-compatibility.js';
 import PackageResolver from '../../package-resolver.js';
 import PackageLinker from '../../package-linker.js';
 import PackageRequest from '../../package-request.js';
@@ -22,45 +21,43 @@ import {registries} from '../../registries/index.js';
 import {clean} from './clean.js';
 import * as constants from '../../constants.js';
 import * as fs from '../../util/fs.js';
-import * as crypto from '../../util/crypto.js';
 import map from '../../util/map.js';
+import {version as YARN_VERSION, getInstallationMethod} from '../../util/yarn-version.js';
+import WorkspaceLayout from '../../workspace-layout.js';
 
-const invariant = require('invariant');
 const emoji = require('node-emoji');
+const invariant = require('invariant');
+const isCI = require('is-ci');
 const path = require('path');
+const semver = require('semver');
+const uuid = require('uuid');
 
-export type InstallPrepared = {
-  skip: boolean,
+const ONE_DAY = 1000 * 60 * 60 * 24;
+
+export type InstallCwdRequest = {
   requests: DependencyRequestPatterns,
   patterns: Array<string>,
-};
-
-export type InstallCwdRequest = [
-  DependencyRequestPatterns,
-  Array<string>,
-  Object
-];
-
-type IntegrityMatch = {
-  actual: string,
-  expected: string,
-  loc: string,
-  matches: boolean,
+  ignorePatterns: Array<string>,
+  usedPatterns: Array<string>,
+  manifest: Object,
+  workspaceLayout?: WorkspaceLayout,
 };
 
 type Flags = {
   // install
+  har: boolean,
   ignorePlatform: boolean,
   ignoreEngines: boolean,
   ignoreScripts: boolean,
   ignoreOptional: boolean,
-  har: boolean,
+  linkDuplicates: boolean,
   force: boolean,
   flat: boolean,
-  production: boolean,
   lockfile: boolean,
   pureLockfile: boolean,
-  skipIntegrity: boolean,
+  frozenLockfile: boolean,
+  skipIntegrityCheck: boolean,
+  checkFiles: boolean,
 
   // add
   peer: boolean,
@@ -69,6 +66,51 @@ type Flags = {
   exact: boolean,
   tilde: boolean,
 };
+
+/**
+ * Try and detect the installation method for Yarn and provide a command to update it with.
+ */
+
+function getUpdateCommand(installationMethod: InstallationMethod): ?string {
+  if (installationMethod === 'tar') {
+    return `curl -o- -L ${constants.YARN_INSTALLER_SH} | bash`;
+  }
+
+  if (installationMethod === 'homebrew') {
+    return 'brew upgrade yarn';
+  }
+
+  if (installationMethod === 'deb') {
+    return 'sudo apt-get update && sudo apt-get install yarn';
+  }
+
+  if (installationMethod === 'rpm') {
+    return 'sudo yum install yarn';
+  }
+
+  if (installationMethod === 'npm') {
+    return 'npm upgrade --global yarn';
+  }
+
+  if (installationMethod === 'chocolatey') {
+    return 'choco upgrade yarn';
+  }
+
+  if (installationMethod === 'apk') {
+    return 'apk update && apk add -u yarn';
+  }
+
+  return null;
+}
+
+function getUpdateInstaller(installationMethod: InstallationMethod): ?string {
+  // Windows
+  if (installationMethod === 'msi') {
+    return constants.YARN_INSTALLER_MSI;
+  }
+
+  return null;
+}
 
 function normalizeFlags(config: Config, rawFlags: Object): Flags {
   const flags = {
@@ -80,10 +122,12 @@ function normalizeFlags(config: Config, rawFlags: Object): Flags {
     ignoreOptional: !!rawFlags.ignoreOptional,
     force: !!rawFlags.force,
     flat: !!rawFlags.flat,
-    production: !!rawFlags.production,
     lockfile: rawFlags.lockfile !== false,
     pureLockfile: !!rawFlags.pureLockfile,
-    skipIntegrity: !!rawFlags.skipIntegrity,
+    skipIntegrityCheck: !!rawFlags.skipIntegrityCheck,
+    frozenLockfile: !!rawFlags.frozenLockfile,
+    linkDuplicates: !!rawFlags.linkDuplicates,
+    checkFiles: !!rawFlags.checkFiles,
 
     // add
     peer: !!rawFlags.peer,
@@ -113,20 +157,11 @@ function normalizeFlags(config: Config, rawFlags: Object): Flags {
     flags.force = true;
   }
 
-  if (config.getOption('production')) {
-    flags.production = true;
-  }
-
   return flags;
 }
 
 export class Install {
-  constructor(
-    flags: Object,
-    config: Config,
-    reporter: Reporter,
-    lockfile: Lockfile,
-  ) {
+  constructor(flags: Object, config: Config, reporter: Reporter, lockfile: Lockfile) {
     this.rootManifestRegistries = [];
     this.rootPatternsToOrigin = map();
     this.resolutions = map();
@@ -136,9 +171,8 @@ export class Install {
     this.flags = normalizeFlags(config, flags);
 
     this.resolver = new PackageResolver(config, lockfile);
-    this.fetcher = new PackageFetcher(config, this.resolver);
-    this.compatibility = new PackageCompatibility(config, this.resolver, this.flags.ignoreEngines);
-    this.linker = new PackageLinker(config, this.resolver, this.flags.ignoreOptional);
+    this.integrityChecker = new InstallationIntegrityChecker(config);
+    this.linker = new PackageLinker(config, this.resolver);
     this.scripts = new PackageInstallScripts(config, this.resolver, this.flags.force);
   }
 
@@ -146,24 +180,30 @@ export class Install {
   rootManifestRegistries: Array<RegistryNames>;
   registries: Array<RegistryNames>;
   lockfile: Lockfile;
-  resolutions: { [packageName: string]: string };
+  resolutions: {[packageName: string]: string};
   config: Config;
   reporter: Reporter;
   resolver: PackageResolver;
   scripts: PackageInstallScripts;
   linker: PackageLinker;
-  compatibility: PackageCompatibility;
-  fetcher: PackageFetcher;
-  rootPatternsToOrigin: { [pattern: string]: string };
+  rootPatternsToOrigin: {[pattern: string]: string};
+  integrityChecker: InstallationIntegrityChecker;
 
   /**
    * Create a list of dependency requests from the current directories manifests.
    */
 
-  async fetchRequestFromCwd(excludePatterns?: Array<string> = []): Promise<InstallCwdRequest> {
+  async fetchRequestFromCwd(
+    excludePatterns?: Array<string> = [],
+    ignoreUnusedPatterns?: boolean = false,
+  ): Promise<InstallCwdRequest> {
     const patterns = [];
-    const deps = [];
+    const deps: DependencyRequestPatterns = [];
     const manifest = {};
+
+    const ignorePatterns = [];
+    const usedPatterns = [];
+    let workspaceLayout;
 
     // exclude package names that are in install args
     const excludeNames = [];
@@ -181,19 +221,28 @@ export class Install {
     for (const registry of Object.keys(registries)) {
       const {filename} = registries[registry];
       const loc = path.join(this.config.cwd, filename);
-      if (!(await fs.exists(loc))) {
+      if (!await fs.exists(loc)) {
         continue;
       }
 
       this.rootManifestRegistries.push(registry);
-      const json = await fs.readJson(loc);
-      await normalizeManifest(json, this.config.cwd, this.config, true);
+      const projectManifestJson = await this.config.readJson(loc);
+      await normalizeManifest(projectManifestJson, this.config.cwd, this.config, true);
 
-      Object.assign(this.resolutions, json.resolutions);
-      Object.assign(manifest, json);
+      Object.assign(this.resolutions, projectManifestJson.resolutions);
+      Object.assign(manifest, projectManifestJson);
 
-      const pushDeps = (depType, {hint, visibility, optional}) => {
-        const depMap = json[depType];
+      const pushDeps = (depType, manifest: Object, {hint, optional}, isUsed) => {
+        if (ignoreUnusedPatterns && !isUsed) {
+          return;
+        }
+        // We only take unused dependencies into consideration to get deterministic hoisting.
+        // Since flat mode doesn't care about hoisting and everything is top level and specified then we can safely
+        // leave these out.
+        if (this.flags.flat && !isUsed) {
+          return;
+        }
+        const depMap = manifest[depType];
         for (const name in depMap) {
           if (excludeNames.indexOf(name) >= 0) {
             continue;
@@ -206,18 +255,51 @@ export class Install {
             pattern += '@' + depMap[name];
           }
 
+          // normalization made sure packages are mentioned only once
+          if (isUsed) {
+            usedPatterns.push(pattern);
+          } else {
+            ignorePatterns.push(pattern);
+          }
+
           this.rootPatternsToOrigin[pattern] = depType;
           patterns.push(pattern);
-          deps.push({pattern, registry, visibility, hint, optional});
+          deps.push({pattern, registry, hint, optional});
         }
       };
 
-      pushDeps('dependencies', {hint: null, visibility: PackageReference.USED, optional: false});
+      pushDeps('dependencies', projectManifestJson, {hint: null, optional: false}, true);
+      pushDeps('devDependencies', projectManifestJson, {hint: 'dev', optional: false}, !this.config.production);
+      pushDeps(
+        'optionalDependencies',
+        projectManifestJson,
+        {hint: 'optional', optional: true},
+        !this.flags.ignoreOptional,
+      );
 
-      const devVisibility = this.flags.production ? PackageReference.ENVIRONMENT_IGNORE : PackageReference.USED;
-      pushDeps('devDependencies', {hint: 'dev', visibility: devVisibility, optional: false});
+      if (this.config.workspacesEnabled) {
+        const workspaces = await this.config.resolveWorkspaces(path.dirname(loc), projectManifestJson);
+        workspaceLayout = new WorkspaceLayout(workspaces, this.config);
+        // add virtual manifest that depends on all workspaces, this way package hoisters and resolvers will work fine
+        const virtualDependencyManifest: Manifest = {
+          _uid: '',
+          name: `workspace-aggregator-${uuid.v4()}`,
+          version: '1.0.0',
+          _registry: 'npm',
+          _loc: '.',
+          dependencies: {},
+        };
+        workspaceLayout.virtualManifestName = virtualDependencyManifest.name;
+        virtualDependencyManifest.dependencies = {};
+        for (const workspaceName of Object.keys(workspaces)) {
+          virtualDependencyManifest.dependencies[workspaceName] = workspaces[workspaceName].manifest.version;
+        }
+        const virtualDep = {};
+        virtualDep[virtualDependencyManifest.name] = virtualDependencyManifest.version;
+        workspaces[virtualDependencyManifest.name] = {loc: '', manifest: virtualDependencyManifest};
 
-      pushDeps('optionalDependencies', {hint: 'optional', visibility: PackageReference.USED, optional: true});
+        pushDeps('workspaces', {workspaces: virtualDep}, {hint: 'workspaces', optional: false}, true);
+      }
 
       break;
     }
@@ -227,30 +309,56 @@ export class Install {
       this.flags.flat = true;
     }
 
-    return [deps, patterns, manifest];
+    return {
+      requests: deps,
+      patterns,
+      manifest,
+      usedPatterns,
+      ignorePatterns,
+      workspaceLayout,
+    };
   }
 
   /**
    * TODO description
    */
 
-  async prepare(
-    patterns: Array<string>,
-    requests: DependencyRequestPatterns,
-    match: IntegrityMatch,
-  ): Promise<InstallPrepared> {
-    if (!this.flags.skipIntegrity && !this.flags.force && match.matches) {
-      this.reporter.success(this.reporter.lang('upToDate'));
-      return {patterns, requests, skip: true};
+  prepareRequests(requests: DependencyRequestPatterns): DependencyRequestPatterns {
+    return requests;
+  }
+
+  preparePatterns(patterns: Array<string>): Array<string> {
+    return patterns;
+  }
+
+  async bailout(patterns: Array<string>, workspaceLayout: ?WorkspaceLayout): Promise<boolean> {
+    if (this.flags.skipIntegrityCheck || this.flags.force) {
+      return false;
+    }
+    const lockfileCache = this.lockfile.cache;
+    if (!lockfileCache) {
+      return false;
+    }
+    const match = await this.integrityChecker.check(patterns, lockfileCache, this.flags, workspaceLayout);
+    if (this.flags.frozenLockfile && match.missingPatterns.length > 0) {
+      throw new MessageError(this.reporter.lang('frozenLockfileError'));
     }
 
-    if (!patterns.length && !match.expected) {
+    const haveLockfile = await fs.exists(path.join(this.config.cwd, constants.LOCKFILE_FILENAME));
+
+    if (match.integrityMatches && haveLockfile) {
+      this.reporter.success(this.reporter.lang('upToDate'));
+      return true;
+    }
+
+    if (!patterns.length && !match.integrityFileMissing) {
       this.reporter.success(this.reporter.lang('nothingToInstall'));
       await this.createEmptyManifestFolders();
-      return {patterns, requests, skip: true};
+      await this.saveLockfileAndIntegrity(patterns);
+      return true;
     }
 
-    return {patterns, requests, skip: false};
+    return false;
   }
 
   /**
@@ -273,44 +381,71 @@ export class Install {
    * TODO description
    */
 
-  async init(): Promise<Array<string>> {
-    let [depRequests, rawPatterns] = await this.fetchRequestFromCwd();
-    const match = await this.matchesIntegrityHash(rawPatterns);
+  markIgnored(patterns: Array<string>) {
+    for (const pattern of patterns) {
+      const manifest = this.resolver.getStrictResolvedPattern(pattern);
+      const ref = manifest._reference;
+      invariant(ref, 'expected package reference');
 
-    const prepared = await this.prepare(rawPatterns, depRequests, match);
-    rawPatterns = prepared.patterns;
-    depRequests = prepared.requests;
-    if (prepared.skip) {
-      return rawPatterns;
+      // just mark the package as ignored. if the package is used by a required package, the hoister
+      // will take care of that.
+      ref.ignore = true;
     }
+  }
 
-    // remove integrity hash to make this operation atomic
-    await fs.unlink(match.loc);
+  /**
+   * TODO description
+   */
+
+  async init(): Promise<Array<string>> {
+    this.checkUpdate();
 
     // warn if we have a shrinkwrap
     if (await fs.exists(path.join(this.config.cwd, 'npm-shrinkwrap.json'))) {
-      this.reporter.error(this.reporter.lang('shrinkwrapWarning'));
+      this.reporter.warn(this.reporter.lang('shrinkwrapWarning'));
     }
 
-    //
-    let patterns = rawPatterns;
-    const steps: Array<(curr: number, total: number) => Promise<void>> = [];
+    let flattenedTopLevelPatterns: Array<string> = [];
+    const steps: Array<(curr: number, total: number) => Promise<{bailout: boolean} | void>> = [];
+    const {
+      requests: depRequests,
+      patterns: rawPatterns,
+      ignorePatterns,
+      workspaceLayout,
+    } = await this.fetchRequestFromCwd();
+    let topLevelPatterns: Array<string> = [];
+
+    const artifacts = await this.integrityChecker.getArtifacts();
+    if (artifacts) {
+      this.linker.setArtifacts(artifacts);
+      this.scripts.setArtifacts(artifacts);
+    }
 
     steps.push(async (curr: number, total: number) => {
       this.reporter.step(curr, total, this.reporter.lang('resolvingPackages'), emoji.get('mag'));
-      await this.resolver.init(depRequests, this.flags.flat);
-      patterns = await this.flatten(rawPatterns);
+      await this.resolver.init(this.prepareRequests(depRequests), {
+        isFlat: this.flags.flat,
+        isFrozen: this.flags.frozenLockfile,
+        workspaceLayout,
+      });
+      topLevelPatterns = this.preparePatterns(rawPatterns);
+      flattenedTopLevelPatterns = await this.flatten(topLevelPatterns);
+      return {bailout: await this.bailout(topLevelPatterns, workspaceLayout)};
     });
 
     steps.push(async (curr: number, total: number) => {
+      this.markIgnored(ignorePatterns);
       this.reporter.step(curr, total, this.reporter.lang('fetchingPackages'), emoji.get('truck'));
-      await this.fetcher.init();
-      await this.compatibility.init();
+      const manifests: Array<Manifest> = await fetcher.fetch(this.resolver.getManifests(), this.config);
+      this.resolver.updateManifests(manifests);
+      await compatibility.check(this.resolver.getManifests(), this.config, this.flags.ignoreEngines);
     });
 
     steps.push(async (curr: number, total: number) => {
+      // remove integrity hash to make this operation atomic
+      await this.integrityChecker.removeIntegrityFile();
       this.reporter.step(curr, total, this.reporter.lang('linkingDependencies'), emoji.get('link'));
-      await this.linker.init(patterns);
+      await this.linker.init(flattenedTopLevelPatterns, this.flags.linkDuplicates, workspaceLayout);
     });
 
     steps.push(async (curr: number, total: number) => {
@@ -324,7 +459,7 @@ export class Install {
       if (this.flags.ignoreScripts) {
         this.reporter.warn(this.reporter.lang('ignoredScripts'));
       } else {
-        await this.scripts.init(patterns);
+        await this.scripts.init(flattenedTopLevelPatterns);
       }
     });
 
@@ -351,13 +486,18 @@ export class Install {
 
     let currentStep = 0;
     for (const step of steps) {
-      await step(++currentStep, steps.length);
+      const stepResult = await step(++currentStep, steps.length);
+      if (stepResult && stepResult.bailout) {
+        this.maybeOutputUpdate();
+        return flattenedTopLevelPatterns;
+      }
     }
 
     // fin!
-    await this.saveLockfileAndIntegrity(rawPatterns);
+    await this.saveLockfileAndIntegrity(topLevelPatterns, workspaceLayout);
+    this.maybeOutputUpdate();
     this.config.requestManager.clearCache();
-    return patterns;
+    return flattenedTopLevelPatterns;
   }
 
   /**
@@ -462,46 +602,87 @@ export class Install {
   }
 
   /**
+   * Remove offline tarballs that are no longer required
+   */
+
+  async pruneOfflineMirror(lockfile: Object): Promise<void> {
+    const mirror = this.config.getOfflineMirrorPath();
+    if (!mirror) {
+      return;
+    }
+
+    const requiredTarballs = new Set();
+    for (const dependency in lockfile) {
+      const resolved = lockfile[dependency].resolved;
+      const basename = path.basename(resolved.split('#')[0]);
+      if (resolved) {
+        if (dependency[0] === '@' && basename[0] !== '@') {
+          requiredTarballs.add(`${dependency.split('/')[0]}-${basename}`);
+        }
+        requiredTarballs.add(basename);
+      }
+    }
+
+    const mirrorFiles = await fs.walk(mirror);
+    for (const file of mirrorFiles) {
+      const isTarball = path.extname(file.basename) === '.tgz';
+      if (isTarball && !requiredTarballs.has(file.basename)) {
+        await fs.unlink(file.absolute);
+      }
+    }
+  }
+
+  /**
    * Save updated integrity and lockfiles.
    */
 
-  async saveLockfileAndIntegrity(patterns: Array<string>): Promise<void> {
-    // stringify current lockfile
-    const lockSource = lockStringify(this.lockfile.getLockfile(this.resolver.patterns)) + '\n';
-
-    // write integrity hash
-    await this.writeIntegrityHash(lockSource, patterns);
-
+  async saveLockfileAndIntegrity(patterns: Array<string>, workspaceLayout: ?WorkspaceLayout): Promise<void> {
     // --no-lockfile or --pure-lockfile flag
     if (this.flags.lockfile === false || this.flags.pureLockfile) {
       return;
     }
 
-    // check if the loaded lockfile has all the included patterns
-    let inSync = true;
-    for (const pattern of patterns) {
-      if (!this.lockfile.getLocked(pattern)) {
-        inSync = false;
-        break;
+    const resolvedPatterns: {[packagePattern: string]: Manifest} = {};
+    Object.keys(this.resolver.patterns).forEach(pattern => {
+      if (!workspaceLayout || !workspaceLayout.getManifestByPattern(pattern)) {
+        resolvedPatterns[pattern] = this.resolver.patterns[pattern];
       }
+    });
+
+    // TODO this code is duplicated in a few places, need a common way to filter out workspace patterns from lockfile
+    patterns = patterns.filter(p => !workspaceLayout || !workspaceLayout.getManifestByPattern(p));
+
+    const lockfileBasedOnResolver = this.lockfile.getLockfile(resolvedPatterns);
+
+    if (this.config.pruneOfflineMirror) {
+      await this.pruneOfflineMirror(lockfileBasedOnResolver);
     }
-    // check if loaded lockfile has patterns we don't have, eg. uninstall
-    for (const pattern in this.lockfile.cache) {
-      if (patterns.indexOf(pattern) === -1) {
-        inSync = false;
-        break;
-      }
-    }
-    // don't write new lockfile if in sync
-    if (inSync) {
+
+    // write integrity hash
+    await this.integrityChecker.save(
+      patterns,
+      lockfileBasedOnResolver,
+      this.flags,
+      this.resolver.usedRegistries,
+      this.scripts.getArtifacts(),
+    );
+
+    const lockFileHasAllPatterns = patterns.every(p => this.lockfile.getLocked(p));
+    const resolverPatternsAreSameAsInLockfile = Object.keys(lockfileBasedOnResolver).every(pattern => {
+      const manifest = this.lockfile.getLocked(pattern);
+      return manifest && manifest.resolved === lockfileBasedOnResolver[pattern].resolved;
+    });
+    // remove command is followed by install with force, lockfile will be rewritten in any case then
+    if (lockFileHasAllPatterns && resolverPatternsAreSameAsInLockfile && patterns.length && !this.flags.force) {
       return;
     }
 
     // build lockfile location
-    const loc = path.join(this.config.cwd, constants.LOCKFILE_FILENAME);
+    const loc = path.join(this.config.lockfileFolder, constants.LOCKFILE_FILENAME);
 
     // write lockfile
-    await fs.writeFile(loc, lockSource);
+    const lockSource = lockStringify(lockfileBasedOnResolver, false, this.config.enableLockfileVersions);
+    await fs.writeFilePreservingEol(loc, lockSource);
 
     this._logSuccessSaveLockfile();
   }
@@ -511,155 +692,128 @@ export class Install {
   }
 
   /**
-   * Check if the integrity hash of this installation matches one on disk.
-   */
-
-  async matchesIntegrityHash(patterns: Array<string>): Promise<IntegrityMatch> {
-    const loc = await this.getIntegrityHashLocation();
-    if (!await fs.exists(loc)) {
-      return {
-        actual: '',
-        expected: '',
-        loc,
-        matches: false,
-      };
-    }
-
-    const actual = this.generateIntegrityHash(this.lockfile.source, patterns);
-    const expected = (await fs.readFile(loc)).trim();
-
-    return {
-      actual,
-      expected,
-      loc,
-      matches: actual === expected,
-    };
-  }
-
-  /**
-   * Get the location of an existing integrity hash. If none exists then return the location where we should
-   * write a new one.
-   */
-
-  async getIntegrityHashLocation(): Promise<string> {
-    // build up possible folders
-    const possibleFolders = [];
-    if (this.config.modulesFolder) {
-      possibleFolders.push(this.config.modulesFolder);
-    }
-
-    // get a list of registry names to check existence in
-    let checkRegistryNames = this.resolver.usedRegistries;
-    if (!checkRegistryNames.length) {
-      // we haven't used any registries yet
-      checkRegistryNames = registryNames;
-    }
-
-    // ensure we only write to a registry folder that was used
-    for (const name of checkRegistryNames) {
-      const loc = path.join(this.config.cwd, this.config.registries[name].folder);
-      possibleFolders.push(loc);
-    }
-
-    // if we already have an integrity hash in one of these folders then use it's location otherwise use the
-    // first folder
-    const possibles = possibleFolders.map((folder): string => path.join(folder, constants.INTEGRITY_FILENAME));
-    let loc = possibles[0];
-    for (const possibleLoc of possibles) {
-      if (await fs.exists(possibleLoc)) {
-        loc = possibleLoc;
-        break;
-      }
-    }
-    return loc;
-  }
-  /**
-   * Write the integrity hash of the current install to disk.
-   */
-
-  async writeIntegrityHash(lockSource: string, patterns: Array<string>): Promise<void> {
-    const loc = await this.getIntegrityHashLocation();
-    invariant(loc, 'expected integrity hash location');
-    await fs.writeFile(loc, this.generateIntegrityHash(lockSource, patterns));
-  }
-
-  /**
-   * Generate integrity hash of input lockfile.
-   */
-
-  generateIntegrityHash(lockfile: string, patterns: Array<string>): string {
-    const opts = [lockfile];
-
-    opts.push(`patterns:${patterns.join(',')}`);
-
-    if (this.flags.flat) {
-      opts.push('flat');
-    }
-
-    if (this.flags.production) {
-      opts.push('production');
-    }
-
-    const linkedModules = this.config.linkedModules;
-    if (linkedModules.length) {
-      opts.push(`linked:${linkedModules.join(',')}`);
-    }
-
-    const mirror = this.config.getOfflineMirrorPath();
-    if (mirror != null) {
-      opts.push(`mirror:${mirror}`);
-    }
-
-    return crypto.hash(opts.join('-'), 'sha256');
-  }
-
-  /**
    * Load the dependency graph of the current install. Only does package resolving and wont write to the cwd.
    */
+  async hydrate(ignoreUnusedPatterns?: boolean): Promise<InstallCwdRequest> {
+    const request = await this.fetchRequestFromCwd([], ignoreUnusedPatterns);
+    const {requests: depRequests, patterns: rawPatterns, ignorePatterns, workspaceLayout} = request;
 
-  async hydrate(fetch?: boolean): Promise<InstallCwdRequest> {
-    const request = await this.fetchRequestFromCwd();
-    const [depRequests, rawPatterns] = request;
-
-    await this.resolver.init(depRequests, this.flags.flat);
+    await this.resolver.init(depRequests, {
+      isFlat: this.flags.flat,
+      isFrozen: this.flags.frozenLockfile,
+      workspaceLayout,
+    });
     await this.flatten(rawPatterns);
+    this.markIgnored(ignorePatterns);
 
-    if (fetch) {
-      // fetch packages, should hit cache most of the time
-      await this.fetcher.init();
+    // fetch packages, should hit cache most of the time
+    const manifests: Array<Manifest> = await fetcher.fetch(this.resolver.getManifests(), this.config);
+    this.resolver.updateManifests(manifests);
+    await compatibility.check(this.resolver.getManifests(), this.config, this.flags.ignoreEngines);
 
-      // expand minimal manifests
-      for (const manifest of this.resolver.getManifests()) {
-        const ref = manifest._reference;
-        invariant(ref, 'expected reference');
-
-        const loc = this.config.generateHardModulePath(ref);
-        const newPkg = await this.config.readManifest(loc);
-        await this.resolver.updateManifest(ref, newPkg);
+    // expand minimal manifests
+    for (const manifest of this.resolver.getManifests()) {
+      const ref = manifest._reference;
+      invariant(ref, 'expected reference');
+      const {type} = ref.remote;
+      // link specifier won't ever hit cache
+      let loc = '';
+      if (type === 'link') {
+        continue;
+      } else if (type === 'workspace') {
+        if (!ref.remote.reference) {
+          continue;
+        }
+        loc = ref.remote.reference;
+      } else {
+        loc = this.config.generateHardModulePath(ref);
       }
+      const newPkg = await this.config.readManifest(loc);
+      await this.resolver.updateManifest(ref, newPkg);
     }
 
     return request;
   }
+
+  /**
+   * Check for updates every day and output a nag message if there's a newer version.
+   */
+
+  checkUpdate() {
+    if (!process.stdout.isTTY || isCI) {
+      // don't show upgrade dialog on CI or non-TTY terminals
+      return;
+    }
+
+    // don't check if disabled
+    if (this.config.getOption('disable-self-update-check')) {
+      return;
+    }
+
+    // only check for updates once a day
+    const lastUpdateCheck = Number(this.config.getOption('lastUpdateCheck')) || 0;
+    if (lastUpdateCheck && Date.now() - lastUpdateCheck < ONE_DAY) {
+      return;
+    }
+
+    // don't bug for updates on tagged releases
+    if (YARN_VERSION.indexOf('-') >= 0) {
+      return;
+    }
+
+    this._checkUpdate().catch(() => {
+      // swallow errors
+    });
+  }
+
+  async _checkUpdate(): Promise<void> {
+    let latestVersion = await this.config.requestManager.request({
+      url: constants.SELF_UPDATE_VERSION_URL,
+    });
+    invariant(typeof latestVersion === 'string', 'expected string');
+    latestVersion = latestVersion.trim();
+    if (!semver.valid(latestVersion)) {
+      return;
+    }
+
+    // ensure we only check for updates periodically
+    this.config.registries.yarn.saveHomeConfig({
+      lastUpdateCheck: Date.now(),
+    });
+
+    if (semver.gt(latestVersion, YARN_VERSION)) {
+      const installationMethod = await getInstallationMethod();
+      this.maybeOutputUpdate = () => {
+        this.reporter.warn(this.reporter.lang('yarnOutdated', latestVersion, YARN_VERSION));
+
+        const command = getUpdateCommand(installationMethod);
+        if (command) {
+          this.reporter.info(this.reporter.lang('yarnOutdatedCommand'));
+          this.reporter.command(command);
+        } else {
+          const installer = getUpdateInstaller(installationMethod);
+          if (installer) {
+            this.reporter.info(this.reporter.lang('yarnOutdatedInstaller', installer));
+          }
+        }
+      };
+    }
+  }
+
+  /**
+   * Method to override with a possible upgrade message.
+   */
+
+  maybeOutputUpdate() {}
+  maybeOutputUpdate: any;
 }
 
-export function _setFlags(commander: Object) {
-  commander.option('--har', 'save HAR output of network traffic');
-  commander.option('--ignore-platform', 'ignore platform checks');
-  commander.option('--ignore-engines', 'ignore engines check');
-  commander.option('--ignore-scripts', '');
-  commander.option('--ignore-optional', '');
-  commander.option('--force', 'ignore all caches');
-  commander.option('--flat', 'only allow one version of a package');
-  commander.option('--prod, --production', '');
-  commander.option('--no-lockfile', "don't read or generate a lockfile");
-  commander.option('--pure-lockfile', "don't generate a lockfile");
+export function hasWrapper(): boolean {
+  return true;
 }
 
 export function setFlags(commander: Object) {
   commander.usage('install [flags]');
-  _setFlags(commander);
-
   commander.option('-g, --global', 'DEPRECATED');
   commander.option('-S, --save', 'DEPRECATED - save package to your `dependencies`');
   commander.option('-D, --save-dev', 'DEPRECATED - save package to your `devDependencies`');
@@ -669,17 +823,12 @@ export function setFlags(commander: Object) {
   commander.option('-T, --save-tilde', 'DEPRECATED');
 }
 
-export async function run(
-  config: Config,
-  reporter: Reporter,
-  flags: Object,
-  args: Array<string>,
-): Promise<void> {
+export async function run(config: Config, reporter: Reporter, flags: Object, args: Array<string>): Promise<void> {
   let lockfile;
   if (flags.lockfile === false) {
     lockfile = new Lockfile();
   } else {
-    lockfile = await Lockfile.fromDirectory(config.cwd, reporter);
+    lockfile = await Lockfile.fromDirectory(config.lockfileFolder, reporter);
   }
 
   if (args.length) {
@@ -706,15 +855,23 @@ export async function run(
     throw new MessageError(reporter.lang('installCommandRenamed', `yarn ${command} ${exampleArgs.join(' ')}`));
   }
 
-  await executeLifecycleScript(config, 'preinstall');
+  await wrapLifecycle(config, flags, async () => {
+    const install = new Install(flags, config, reporter, lockfile);
+    await install.init();
+  });
+}
 
-  const install = new Install(flags, config, reporter, lockfile);
-  await install.init();
+export async function wrapLifecycle(config: Config, flags: Object, factory: () => Promise<void>): Promise<void> {
+  await config.executeLifecycleScript('preinstall');
+
+  await factory();
 
   // npm behaviour, seems kinda funky but yay compatibility
-  await executeLifecycleScript(config, 'install');
-  await executeLifecycleScript(config, 'postinstall');
-  if (!flags.production) {
-    await executeLifecycleScript(config, 'prepublish');
+  await config.executeLifecycleScript('install');
+  await config.executeLifecycleScript('postinstall');
+
+  if (!config.production) {
+    await config.executeLifecycleScript('prepublish');
+    await config.executeLifecycleScript('prepare');
   }
 }

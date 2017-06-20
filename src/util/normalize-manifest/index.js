@@ -7,14 +7,7 @@ import fix from './fix.js';
 
 const path = require('path');
 
-export default async function (
-  info: Object,
-  moduleLoc: string,
-  config: Config,
-  isRoot: boolean,
-): Promise<Manifest> {
-  await fix(info, moduleLoc, config.reporter, config.looseSemver);
-
+export default (async function(info: Object, moduleLoc: string, config: Config, isRoot: boolean): Promise<Manifest> {
   // create human readable name
   const {name, version} = info;
   let human: ?string;
@@ -35,6 +28,7 @@ export default async function (
     config.reporter.warn(msg);
   }
 
+  await fix(info, moduleLoc, config.reporter, warn, config.looseSemver);
   try {
     validate(info, isRoot, config.reporter, warn);
   } catch (err) {
@@ -45,4 +39,4 @@ export default async function (
   }
 
   return info;
-}
+});

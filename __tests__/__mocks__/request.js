@@ -3,7 +3,13 @@
 import type {ClientRequest} from 'http';
 import type {ReadStream} from 'fs';
 
-const realRequest = require.requireActual('request');
+// TODO: create flow-typed libdefs for the 'request' module
+//       for now this will do its job
+type RequestModule = {
+  Request: any,
+};
+
+const realRequest: RequestModule = (require: any).requireActual('request');
 const RealRequest = realRequest.Request;
 
 const mkdirp = require('mkdirp');
@@ -14,6 +20,8 @@ const url = require('url');
 const fs = require('fs');
 
 const CACHE_DIR = path.join(__dirname, '..', 'fixtures', 'request-cache');
+
+let authedRequests = [];
 
 function getRequestAlias(params: Object): string {
   const parts = url.parse(params.path);
@@ -45,6 +53,11 @@ module.exports = function(params: Object): Request {
 
 module.exports.Request = Request;
 
+module.exports.__resetAuthedRequests = (): void => {
+  authedRequests = [];
+};
+module.exports.__getAuthedRequests = (): Array<Object> => authedRequests;
+
 const httpMock = {
   request(options: Object, callback?: ?Function): ClientRequest {
     const alias = getRequestAlias(options);
@@ -54,6 +67,14 @@ const httpMock = {
 
     // TODO better way to do this
     const httpModule = options.uri.href.startsWith('https:') ? https : http;
+
+    // expose authorized requests to the tests for assertion
+    if (options.headers.authorization) {
+      authedRequests.push({
+        headers: options.headers,
+        url: options.uri.href,
+      });
+    }
 
     if (allowCache && fs.existsSync(loc)) {
       // cached
@@ -68,6 +89,10 @@ const httpMock = {
       const req = httpModule.request(options, callback);
       let errored = false;
       const bufs = [];
+      // to track situations when CI gets stalled because of many network requests
+      if (options.uri.href.indexOf('localhost') === -1) {
+        console.warn('No request cache for', options.uri.href);
+      }
 
       req.once('socket', function(socket) {
         socket.setMaxListeners(Infinity);

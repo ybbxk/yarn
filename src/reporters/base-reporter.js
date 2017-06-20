@@ -10,22 +10,28 @@ import type {
   Package,
   ReporterSpinner,
   QuestionOptions,
+  PromptOptions,
 } from './types.js';
 import type {LanguageKeys} from './lang/en.js';
 import type {Formatter} from './format.js';
 import {defaultFormatter} from './format.js';
 import * as languages from './lang/index.js';
+import isCI from 'is-ci';
 
 const util = require('util');
+const EventEmitter = require('events').EventEmitter;
 
 type Language = $Keys<typeof languages>;
 
 export type ReporterOptions = {
+  verbose?: boolean,
   language?: Language,
   stdout?: Stdout,
   stderr?: Stdout,
   stdin?: Stdin,
   emoji?: boolean,
+  noProgress?: boolean,
+  silent?: boolean,
 };
 
 export function stringifyLangArgs(args: Array<any>): Array<string> {
@@ -34,7 +40,10 @@ export function stringifyLangArgs(args: Array<any>): Array<string> {
       return val.inspect();
     } else {
       try {
-        return JSON.stringify(val) || val + '';
+        const str = JSON.stringify(val) || val + '';
+        // should match all "u001b" that follow an odd number of backslashes and convert them to ESC
+        // we do this because the JSON.stringify process has escaped these characters
+        return str.replace(/((?:^|[^\\])(?:\\{2})*)\\u001[bB]/g, '$1\u001b');
       } catch (e) {
         return util.inspect(val);
       }
@@ -49,8 +58,10 @@ export default class BaseReporter {
 
     this.stdout = opts.stdout || process.stdout;
     this.stderr = opts.stderr || process.stderr;
-    this.stdin = opts.stdin || process.stdin;
+    this.stdin = opts.stdin || this._getStandardInput();
     this.emoji = !!opts.emoji;
+    this.noProgress = !!opts.noProgress || isCI;
+    this.isVerbose = !!opts.verbose;
 
     // $FlowFixMe: this is valid!
     this.isTTY = this.stdout.isTTY;
@@ -67,6 +78,9 @@ export default class BaseReporter {
   stdin: Stdin;
   isTTY: boolean;
   emoji: boolean;
+  noProgress: boolean;
+  isVerbose: boolean;
+  isSilent: boolean;
   format: Formatter;
 
   peakMemoryInterval: ?number;
@@ -86,6 +100,38 @@ export default class BaseReporter {
     return msg.replace(/\$(\d+)/g, (str, i: number) => {
       return stringifiedArgs[i];
     });
+  }
+
+  verbose(msg: string) {
+    if (this.isVerbose) {
+      this._verbose(msg);
+    }
+  }
+
+  verboseInspect(val: any) {
+    if (this.isVerbose) {
+      this._verboseInspect(val);
+    }
+  }
+
+  _verbose(msg: string) {}
+  _verboseInspect(val: any) {}
+
+  _getStandardInput(): Stdin {
+    let standardInput;
+
+    // Accessing stdin in a win32 headless process (e.g., Visual Studio) may throw an exception.
+    try {
+      standardInput = process.stdin;
+    } catch (e) {
+      console.warn(e.message);
+      delete process.stdin;
+      // $FlowFixMe: this is valid!
+      process.stdin = new EventEmitter();
+      standardInput = process.stdin;
+    }
+
+    return standardInput;
   }
 
   initPeakMemoryCounter() {
@@ -114,9 +160,9 @@ export default class BaseReporter {
   }
 
   // TODO
-  list(key: string, items: Array<string>) {}
+  list(key: string, items: Array<string>, hints?: Object) {}
 
-  // TODO
+  // Outputs basic tree structure to console
   tree(key: string, obj: Trees) {}
 
   // called whenever we begin a step in the CLI.
@@ -208,5 +254,15 @@ export default class BaseReporter {
   // render a progress bar and return a function which when called will trigger an update
   progress(total: number): () => void {
     return function() {};
+  }
+
+  // utility function to disable progress bar
+  disableProgress() {
+    this.noProgress = true;
+  }
+
+  //
+  prompt<T>(message: string, choices: Array<*>, options?: PromptOptions = {}): Promise<Array<T>> {
+    return Promise.reject(new Error('Not implemented'));
   }
 }

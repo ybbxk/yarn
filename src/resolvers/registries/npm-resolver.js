@@ -2,6 +2,7 @@
 
 import type {Manifest} from '../../types.js';
 import type Config from '../../config.js';
+import type PackageRequest from '../../package-request.js';
 import {MessageError} from '../../errors.js';
 import RegistryResolver from './registry-resolver.js';
 import NpmRegistry from '../../registries/npm-registry.js';
@@ -9,6 +10,8 @@ import map from '../../util/map.js';
 import * as fs from '../../util/fs.js';
 import {YARN_REGISTRY} from '../../constants.js';
 
+const inquirer = require('inquirer');
+const tty = require('tty');
 const invariant = require('invariant');
 const path = require('path');
 
@@ -16,14 +19,23 @@ const NPM_REGISTRY = /http[s]:\/\/registry.npmjs.org/g;
 
 type RegistryResponse = {
   name: string,
-  versions: { [key: string]: Manifest },
-  "dist-tags": { [key: string]: string },
+  versions: {[key: string]: Manifest},
+  'dist-tags': {[key: string]: string},
 };
 
 export default class NpmResolver extends RegistryResolver {
   static registry = 'npm';
 
-  static async findVersionInRegistryResponse(config: Config, range: string, body: RegistryResponse): Promise<Manifest> {
+  static async findVersionInRegistryResponse(
+    config: Config,
+    range: string,
+    body: RegistryResponse,
+    request: ?PackageRequest,
+  ): Promise<Manifest> {
+    if (!body['dist-tags']) {
+      throw new MessageError(config.reporter.lang('malformedRegistryResponse', body.name));
+    }
+
     if (range in body['dist-tags']) {
       range = body['dist-tags'][range];
     }
@@ -31,17 +43,34 @@ export default class NpmResolver extends RegistryResolver {
     const satisfied = await config.resolveConstraints(Object.keys(body.versions), range);
     if (satisfied) {
       return body.versions[satisfied];
-    } else {
-      throw new MessageError(
-        `Couldn't find any versions for ${body.name} that matches ${range}. ` +
-        `Possible versions: ${Object.keys(body.versions).join(', ')}`,
-      );
+    } else if (request && !config.nonInteractive) {
+      if (request.resolver && request.resolver.activity) {
+        request.resolver.activity.end();
+      }
+      config.reporter.log(config.reporter.lang('couldntFindVersionThatMatchesRange', body.name, range));
+      let pageSize;
+      if (process.stdout instanceof tty.WriteStream) {
+        pageSize = process.stdout.rows - 2;
+      }
+      const response: {[key: string]: ?string} = await inquirer.prompt([
+        {
+          name: 'package',
+          type: 'list',
+          message: config.reporter.lang('chooseVersionFromList', body.name),
+          choices: Object.keys(body.versions).reverse(),
+          pageSize,
+        },
+      ]);
+      if (response && response.package) {
+        return body.versions[response.package];
+      }
     }
+    throw new MessageError(config.reporter.lang('couldntFindVersionThatMatchesRange', body.name, range));
   }
 
   async resolveRequest(): Promise<?Manifest> {
     if (this.config.offline) {
-      const res = this.resolveRequestOffline();
+      const res = await this.resolveRequestOffline();
       if (res != null) {
         return res;
       }
@@ -50,18 +79,19 @@ export default class NpmResolver extends RegistryResolver {
     const body = await this.config.registries.npm.request(NpmRegistry.escapeName(this.name));
 
     if (body) {
-      return await NpmResolver.findVersionInRegistryResponse(this.config, this.range, body);
+      return NpmResolver.findVersionInRegistryResponse(this.config, this.range, body, this.request);
     } else {
       return null;
     }
   }
 
   async resolveRequestOffline(): Promise<?Manifest> {
+    const scope = this.config.registries.npm.getScope(this.name);
     // find modules of this name
-    const prefix = `npm-${this.name}-`;
+    const prefix = scope ? this.name.split(/\/|%2f/)[1] : `npm-${this.name}-`;
 
-    const cacheFolder = this.config.cacheFolder;
-    invariant(cacheFolder, 'expected packages root');
+    invariant(this.config.cacheFolder, 'expected packages root');
+    const cacheFolder = path.join(this.config.cacheFolder, scope ? 'npm-' + scope : '');
 
     const files = await this.config.getCache('cachedPackages', async (): Promise<Array<string>> => {
       const files = await fs.readdir(cacheFolder);
@@ -101,11 +131,13 @@ export default class NpmResolver extends RegistryResolver {
 
       // read package metadata
       const metadata = await this.config.readPackageMetadata(dir);
-      if (!metadata._remote) {
+      if (!metadata.remote) {
         continue; // old yarn metadata
       }
 
-      versions[pkg.version] = Object.assign({}, pkg, {_remote: metadata.remote});
+      versions[pkg.version] = Object.assign({}, pkg, {
+        _remote: metadata.remote,
+      });
     }
 
     const satisfied = await this.config.resolveConstraints(Object.keys(versions), this.range);
@@ -113,12 +145,7 @@ export default class NpmResolver extends RegistryResolver {
       return versions[satisfied];
     } else if (!this.config.preferOffline) {
       throw new MessageError(
-        this.reporter.lang(
-          'couldntFindPackageInCache',
-          this.name,
-          this.range,
-          Object.keys(versions).join(', '),
-        ),
+        this.reporter.lang('couldntFindPackageInCache', this.name, this.range, Object.keys(versions).join(', ')),
       );
     } else {
       return null;
@@ -162,6 +189,7 @@ export default class NpmResolver extends RegistryResolver {
         reference: this.cleanRegistry(dist.tarball),
         hash: dist.shasum,
         registry: 'npm',
+        packageName: info.name,
       };
     }
 

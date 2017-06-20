@@ -2,18 +2,12 @@
 
 import type {RegistryNames} from './registries/index.js';
 import type PackageReference from './package-reference.js';
-import type {VisibilityAction} from './package-reference.js';
 import type PackageRequest from './package-request.js';
 import type {FetcherNames} from './fetchers/index.js';
 import type {Reporter} from './reporters/index.js';
 import type Config from './config.js';
 
-export type CLIFunction = (
-  config: Config,
-  reporter: Reporter,
-  flags: Object,
-  args: Array<string>,
-) => CLIFunctionReturn;
+export type CLIFunction = (config: Config, reporter: Reporter, flags: Object, args: Array<string>) => CLIFunctionReturn;
 
 type _CLIFunctionReturn = boolean;
 export type CLIFunctionReturn = ?_CLIFunctionReturn | Promise<?_CLIFunctionReturn>;
@@ -24,7 +18,6 @@ export type DependencyRequestPattern = {
   pattern: string,
   registry: RegistryNames,
   optional: boolean,
-  visibility: VisibilityAction,
   hint?: ?string,
   parentRequest?: ?PackageRequest,
 };
@@ -34,7 +27,7 @@ export type DependencyRequestPatterns = Array<DependencyRequestPattern>;
 export type PersonObject = {
   email?: string,
   name?: string,
-  url?: string
+  url?: string,
 };
 
 // package remote that's used to store how to fetch a package
@@ -43,21 +36,30 @@ export type PackageRemote = {
   registry: RegistryNames,
   reference: string,
   resolved?: ?string,
-  hash?: ?string,
+  hash: ?string,
+  packageName?: string,
 };
 
 // `dependencies` field in package info
 type Dependencies = {
-  [key: string]: string
+  [key: string]: string,
 };
 
-// package.json/bower.json etc
+// package.json
 export type Manifest = {
   _registry?: ?RegistryNames,
   _loc?: ?string,
 
   name: string,
   version: string,
+
+  private?: boolean,
+
+  author?: {
+    name?: string,
+    email?: string,
+    url?: string,
+  },
 
   homepage?: string,
   flat?: boolean,
@@ -68,12 +70,12 @@ export type Manifest = {
   readmeFilename?: string,
 
   repository?: {
-    type: "git",
-    url: string
+    type: 'git',
+    url: string,
   },
 
   bugs?: {
-    url: string
+    url: string,
   },
 
   // the package reference that we pass around as a minimal way to refer to it
@@ -87,26 +89,26 @@ export type Manifest = {
 
   dist?: {
     tarball: string,
-    shasum: string
+    shasum: string,
   },
 
   directories?: {
     man: string,
-    bin: string
+    bin: string,
   },
 
   man?: Array<string>,
 
   bin?: {
-    [name: string]: string
+    [name: string]: string,
   },
 
   scripts?: {
-    [name: string]: string
+    [name: string]: string,
   },
 
   engines?: {
-    [engineName: string]: string
+    [engineName: string]: string,
   },
 
   os?: Array<string>,
@@ -122,16 +124,37 @@ export type Manifest = {
 
   deprecated?: string,
   files?: Array<string>,
+  main?: string,
+
+  workspaces?: Array<string>,
+
+  // This flag is true when we add a new package with `yarn add <mypackage>`.
+  // We need to preserve the flag because we print a list of new packages in
+  // the end of the add command
+  fresh?: boolean,
 };
 
 //
 export type FetchedMetadata = {
   package: Manifest,
-  resolved: ?string,
   hash: string,
   dest: string,
+  cached: boolean,
 };
 export type FetchedOverride = {
   hash: string,
-  resolved: ?string,
+};
+
+// Used by outdated and upgrade-interactive
+export type Dependency = {
+  name: string,
+  current: string,
+  wanted: string,
+  latest: string,
+  url: string,
+  hint: ?string,
+};
+
+export type WorkspacesManifestMap = {
+  [string]: {loc: string, manifest: Manifest},
 };

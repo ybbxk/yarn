@@ -1,6 +1,7 @@
 /* @flow */
 /* eslint no-unused-vars: 0 */
 
+import type Reporter from '../reporters/base-reporter.js';
 import type {PackageRemote, FetchedMetadata, FetchedOverride} from '../types.js';
 import type {RegistryNames} from '../registries/index.js';
 import type Config from '../config.js';
@@ -11,6 +12,8 @@ const path = require('path');
 
 export default class BaseFetcher {
   constructor(dest: string, remote: PackageRemote, config: Config) {
+    this.reporter = config.reporter;
+    this.packageName = remote.packageName;
     this.reference = remote.reference;
     this.registry = remote.registry;
     this.hash = remote.hash;
@@ -19,14 +22,16 @@ export default class BaseFetcher {
     this.dest = dest;
   }
 
+  reporter: Reporter;
   remote: PackageRemote;
   registry: RegistryNames;
+  packageName: ?string;
   reference: string;
   config: Config;
   hash: ?string;
   dest: string;
 
-  getResolvedFromCached(hash: string): Promise<?string> {
+  setupMirrorFromCache(): Promise<?string> {
     // fetcher subclasses may use this to perform actions such as copying over a cached tarball to the offline
     // mirror etc
     return Promise.resolve();
@@ -38,27 +43,34 @@ export default class BaseFetcher {
 
   fetch(): Promise<FetchedMetadata> {
     const {dest} = this;
-
     return fs.lockQueue.push(dest, async (): Promise<FetchedMetadata> => {
       await fs.mkdirp(dest);
 
       // fetch package and get the hash
-      const {hash, resolved} = await this._fetch();
+      const {hash} = await this._fetch();
 
       // load the new normalized manifest
       const pkg = await this.config.readManifest(dest, this.registry);
 
-      await fs.writeFile(path.join(dest, constants.METADATA_FILENAME), JSON.stringify({
-        remote: this.remote,
-        registry: this.registry,
-        hash,
-      }, null, '  '));
+      await fs.writeFile(
+        path.join(dest, constants.METADATA_FILENAME),
+        JSON.stringify(
+          {
+            artifacts: [],
+            remote: this.remote,
+            registry: this.registry,
+            hash,
+          },
+          null,
+          '  ',
+        ),
+      );
 
       return {
-        resolved,
         hash,
         dest,
         package: pkg,
+        cached: false,
       };
     });
   }

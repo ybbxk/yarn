@@ -7,7 +7,20 @@ param(
 
 $ErrorActionPreference = 'Stop'; # stop on all errors
 
-$latest_version = [String](Invoke-WebRequest -Uri https://yarnpkg.com/latest-version)
+if ($Env:YARN_RC -eq 'true') {
+  Write-Output 'This is an RC release; Chocolatey will not be updated'
+  Exit
+}
+
+# See if YARN_VERSION was passed in the environment, otherwise get version
+# number from Yarn site
+if ($Env:YARN_VERSION) {
+  $latest_version = $Env:YARN_VERSION
+} else {
+  Write-Output 'Getting Yarn version from https://yarnpkg.com/latest-version'
+  $latest_version = [String](Invoke-WebRequest -Uri https://yarnpkg.com/latest-version -UseBasicParsing)
+}
+
 $latest_chocolatey_version = (Find-Package -Name Yarn).Version
 
 if ([Version]$latest_chocolatey_version -ge [Version]$latest_version) {
@@ -33,12 +46,12 @@ Invoke-WebRequest -Uri $url -OutFile $installer_file
 $hash = (Get-FileHash -Path $installer_file -Algorithm SHA256).Hash
 
 # Replace placeholders in chocolateyInstall.ps1
-(Get-Content .\resources\win-chocolatey\tools\chocolateyinstall.ps1.in) `
+(Get-Content $PSScriptRoot\..\resources\win-chocolatey\tools\chocolateyinstall.ps1.in) `
   -replace '{VERSION}', $latest_version `
   -replace '{CHECKSUM}', $hash | 
-  Set-Content .\resources\win-chocolatey\tools\chocolateyinstall.ps1
+  Set-Content $PSScriptRoot\..\resources\win-chocolatey\tools\chocolateyinstall.ps1
   
-choco pack .\resources\win-chocolatey\yarn.nuspec --version $latest_version
+choco pack $PSScriptRoot\..\resources\win-chocolatey\yarn.nuspec --version $latest_version
 mv *.nupkg artifacts
 
 if (!$Publish) {

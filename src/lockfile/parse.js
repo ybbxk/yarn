@@ -81,13 +81,19 @@ export function* tokenise(input: string): Iterator<Token> {
       }
     } else if (input[0] === '"') {
       let val = '';
+
       for (let i = 0; ; i++) {
-        const char = input[i];
-        val += char;
-        if (i > 0 && char === '"' && input[i - 1] !== "\\" && input[i - 2] !== "\\") {
-          break;
+        const currentChar = input[i];
+        val += currentChar;
+
+        if (i > 0 && currentChar === '"') {
+          const isEscaped = input[i - 1] === '\\' && input[i - 2] !== '\\';
+          if (!isEscaped) {
+            break;
+          }
         }
       }
+
       chop = val.length;
 
       try {
@@ -119,8 +125,8 @@ export function* tokenise(input: string): Iterator<Token> {
     } else if (input[0] === ',') {
       yield buildToken(TOKEN_TYPES.comma);
       chop++;
-    } else if (/^[a-zA-Z]/g.test(input)) {
-      let name = "";
+    } else if (/^[a-zA-Z\/-]/g.test(input)) {
+      let name = '';
       for (let i = 0; i < input.length; i++) {
         const char = input[i];
         if (char === ':' || char === ' ' || char === '\n' || char === ',') {
@@ -150,11 +156,13 @@ export function* tokenise(input: string): Iterator<Token> {
 }
 
 export class Parser {
-  constructor(input: string) {
+  constructor(input: string, fileLoc: string = 'lockfile') {
     this.comments = [];
     this.tokens = tokenise(input);
+    this.fileLoc = fileLoc;
   }
 
+  fileLoc: string;
   token: Token;
   tokens: Iterator<Token>;
   comments: Array<string>;
@@ -171,7 +179,7 @@ export class Parser {
       if (version > LOCKFILE_VERSION) {
         throw new MessageError(
           `Can't install from a lockfile of version ${version} as you're on an old yarn version that only supports ` +
-          `versions up to ${LOCKFILE_VERSION}. Run \`$ yarn self-update\` to upgrade to the latest version.`,
+            `versions up to ${LOCKFILE_VERSION}. Run \`$ yarn self-update\` to upgrade to the latest version.`,
         );
       }
     }
@@ -190,12 +198,12 @@ export class Parser {
       this.onComment(value);
       return this.next();
     } else {
-      return this.token = value;
+      return (this.token = value);
     }
   }
 
   unexpected(msg: string = 'Unexpected token') {
-    throw new SyntaxError(`${msg} ${this.token.line}:${this.token.col}`);
+    throw new SyntaxError(`${msg} ${this.token.line}:${this.token.col} in ${this.fileLoc}`);
   }
 
   expect(tokType: string) {
@@ -273,7 +281,8 @@ export class Parser {
 
         const valToken = this.token;
 
-        if (valToken.type === TOKEN_TYPES.colon) { // object
+        if (valToken.type === TOKEN_TYPES.colon) {
+          // object
           this.next();
 
           // parse object
@@ -286,7 +295,8 @@ export class Parser {
           if (indent && this.token.type !== TOKEN_TYPES.indent) {
             break;
           }
-        } else if (isValidPropValueToken(valToken)) { // plain value
+        } else if (isValidPropValueToken(valToken)) {
+          // plain value
           for (const key of keys) {
             obj[key] = valToken.value;
           }
@@ -304,9 +314,9 @@ export class Parser {
   }
 }
 
-export default function(str: string): Object {
+export default function(str: string, fileLoc: string = 'lockfile'): Object {
   str = stripBOM(str);
-  const parser = new Parser(str);
+  const parser = new Parser(str, fileLoc);
   parser.next();
   return parser.parse();
 }

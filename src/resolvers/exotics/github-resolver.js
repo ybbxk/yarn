@@ -22,15 +22,22 @@ export default class GitHubResolver extends HostedGitResolver {
   }
 
   static getTarballUrl(parts: ExplodedFragment, hash: string): string {
-    return `https://codeload.github.com/${parts.user}/${parts.repo}/tar.gz/${hash}`;
+    return `https://codeload.${this.hostname}/${parts.user}/${parts.repo}/tar.gz/${hash}`;
   }
 
   static getGitSSHUrl(parts: ExplodedFragment): string {
-    return `git@github.com:${parts.user}/${parts.repo}.git`;
+    return (
+      `git+ssh://git@${this.hostname}/${parts.user}/${parts.repo}.git` +
+      `${parts.hash ? '#' + decodeURIComponent(parts.hash) : ''}`
+    );
+  }
+
+  static getGitHTTPBaseUrl(parts: ExplodedFragment): string {
+    return `https://${this.hostname}/${parts.user}/${parts.repo}`;
   }
 
   static getGitHTTPUrl(parts: ExplodedFragment): string {
-    return `https://github.com/${parts.user}/${parts.repo}.git`;
+    return `${GitHubResolver.getGitHTTPBaseUrl(parts)}.git`;
   }
 
   static getHTTPFileUrl(parts: ExplodedFragment, filename: string, commit: string): string {

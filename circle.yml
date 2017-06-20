@@ -11,7 +11,7 @@ machine:
 
 dependencies:
   cache_directories:
-    - "~/.yarn-cache"
+    - "~/.cache/yarn"
 
   override:
     - which node
@@ -19,31 +19,42 @@ dependencies:
     # install dependencies
     - ./scripts/bootstrap-env-ubuntu.sh
 
-    # https://github.com/yarnpkg/yarn/issues/1142, /usr/bin/node is not available in ubuntu
-    - node $(which yarn) install
-
-    # setup ghr
-    - curl -L -o ghr.zip https://github.com/tcnksm/ghr/releases/download/v0.5.0/ghr_v0.5.0_linux_amd64.zip
-    - unzip ghr.zip
+    - yarn install
 
 test:
   override:
     - node -v
-    - npm run lint
-    - npm run test-ci
-    - npm run check-lockfile
-    - npm run build-dist
-    - node ./scripts/build-webpack.js
-    - ./scripts/build-deb.sh
+    - >
+      if [ "$CIRCLE_BRANCH" == 'master' ]; then
+        ./scripts/set-dev-version.js
+      fi;
+    - yarn lint
+    - yarn test-ci -- -- --maxWorkers 3
+    - yarn check-lockfile
+    - yarn run build-dist
+    - yarn run build-deb
+    # Test that the standalone .js build works as expected
+    - ./artifacts/yarn-`./dist/bin/yarn --version`.js --version
+    - ./artifacts/yarn-legacy-`./dist/bin/yarn --version`.js --version
+
+    # Test that installing as root works and that it also works
+    # behind a user namespace which Circle CI tests are run under
+    - sudo env "PATH=$PATH" bin/yarn install --force
 
 deployment:
   release:
     tag: /v[0-9]+(\.[0-9]+)*/
     owner: yarnpkg
     commands:
-      - ./ghr --username yarnpkg --repository yarn --token $KPM_CIRCLE_RELEASE_TOKEN v$(node dist/bin/yarn --version) artifacts/
-      # TODO(#548): All artifacts should come from artifacts/ directory
-      - ./ghr --username yarnpkg --repository yarn --token $KPM_CIRCLE_RELEASE_TOKEN v$(node dist/bin/yarn --version) dist/yarn-v*.tar.gz
-      - ./ghr --username yarnpkg --repository yarn --token $KPM_CIRCLE_RELEASE_TOKEN v$(node dist/bin/yarn --version) dist/yarn-$(node dist/bin/yarn --version).js
-      - ./ghr --username yarnpkg --repository yarn --token $KPM_CIRCLE_RELEASE_TOKEN v$(node dist/bin/yarn --version) dist/yarn-legacy-$(node dist/bin/yarn --version).js
-      - npm publish
+      # Only NPM is handled here - All other release files are handled in a webhook.
+      - echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+      - ./scripts/set-installation-method.js "`pwd`/package.json" npm
+      # https://github.com/yarnpkg/yarn/issues/610, need to make yarn publish noninteractive
+      - npm publish --tag rc
+
+notify:
+  webhooks:
+    # Handles uploading stable/RC releases to GitHub
+    - url: https://nightly.yarnpkg.com/release_circleci
+    # Handles archiving all builds onto the nightly build site
+    - url: https://nightly.yarnpkg.com/archive_circleci

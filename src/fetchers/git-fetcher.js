@@ -5,9 +5,10 @@ import type {FetchedOverride} from '../types.js';
 import BaseFetcher from './base-fetcher.js';
 import Git from '../util/git.js';
 import * as fsUtil from '../util/fs.js';
+import * as constants from '../constants.js';
 import * as crypto from '../util/crypto.js';
 
-const tar = require('tar');
+const tarFs = require('tar-fs');
 const url = require('url');
 const path = require('path');
 const fs = require('fs');
@@ -15,52 +16,110 @@ const fs = require('fs');
 const invariant = require('invariant');
 
 export default class GitFetcher extends BaseFetcher {
-  _fetch(): Promise<FetchedOverride> {
-    const {protocol, pathname} = url.parse(this.reference);
-    if (protocol === null && typeof pathname === 'string') {
-      return this.fetchFromLocal(pathname);
-    } else {
-      return this.fetchFromExternal();
+  async setupMirrorFromCache(): Promise<?string> {
+    const tarballMirrorPath = this.getTarballMirrorPath();
+    const tarballCachePath = this.getTarballCachePath();
+
+    if (tarballMirrorPath == null) {
+      return;
+    }
+
+    if (!await fsUtil.exists(tarballMirrorPath) && (await fsUtil.exists(tarballCachePath))) {
+      // The tarball doesn't exists in the offline cache but does in the cache; we import it to the mirror
+      await fsUtil.mkdirp(path.dirname(tarballMirrorPath));
+      await fsUtil.copy(tarballCachePath, tarballMirrorPath, this.reporter);
     }
   }
 
-  async fetchFromLocal(pathname: string): Promise<FetchedOverride> {
-    const {reference: ref, config} = this;
-    const offlineMirrorPath = config.getOfflineMirrorPath() || '';
-    const localTarball = path.resolve(offlineMirrorPath, ref);
-    if (!(await fsUtil.exists(localTarball))) {
-      throw new MessageError(`${ref}: Tarball is not in network and can not be located in cache (${localTarball})`);
+  async getLocalAvailabilityStatus(): Promise<boolean> {
+    // Some mirrors might still have files named "./reponame" instead of "./reponame-commit"
+    const tarballLegacyMirrorPath = this.getTarballMirrorPath({
+      withCommit: false,
+    });
+    const tarballModernMirrorPath = this.getTarballMirrorPath();
+    const tarballCachePath = this.getTarballCachePath();
+
+    if (tarballLegacyMirrorPath != null && (await fsUtil.exists(tarballLegacyMirrorPath))) {
+      return true;
+    }
+
+    if (tarballModernMirrorPath != null && (await fsUtil.exists(tarballModernMirrorPath))) {
+      return true;
+    }
+
+    if (await fsUtil.exists(tarballCachePath)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  getTarballMirrorPath({withCommit = true}: {withCommit: boolean} = {}): ?string {
+    const {pathname} = url.parse(this.reference);
+
+    if (pathname == null) {
+      return null;
+    }
+
+    const hash = this.hash;
+
+    const packageFilename = withCommit && hash ? `${path.basename(pathname)}-${hash}` : `${path.basename(pathname)}`;
+
+    return this.config.getOfflineMirrorPath(packageFilename);
+  }
+
+  getTarballCachePath(): string {
+    return path.join(this.dest, constants.TARBALL_FILENAME);
+  }
+
+  async fetchFromLocal(override: ?string): Promise<FetchedOverride> {
+    const tarballLegacyMirrorPath = this.getTarballMirrorPath({
+      withCommit: false,
+    });
+    const tarballModernMirrorPath = this.getTarballMirrorPath();
+    const tarballCachePath = this.getTarballCachePath();
+
+    const tarballMirrorPath = tarballModernMirrorPath && (await fsUtil.exists(tarballModernMirrorPath))
+      ? tarballModernMirrorPath
+      : tarballLegacyMirrorPath && (await fsUtil.exists(tarballLegacyMirrorPath)) ? tarballLegacyMirrorPath : null;
+
+    const tarballPath = override || tarballMirrorPath || tarballCachePath;
+
+    if (!tarballPath || !await fsUtil.exists(tarballPath)) {
+      throw new MessageError(this.reporter.lang('tarballNotInNetworkOrCache', this.reference, tarballPath));
     }
 
     return new Promise((resolve, reject) => {
-      const untarStream = tar.Extract({path: this.dest});
+      const untarStream = tarFs.extract(this.dest, {
+        dmode: 0o555, // all dirs should be readable
+        fmode: 0o444, // all files should be readable
+        chown: false, // don't chown. just leave as it is
+      });
 
       const hashStream = new crypto.HashStream();
 
-      const cachedStream = fs.createReadStream(localTarball);
+      const cachedStream = fs.createReadStream(tarballPath);
       cachedStream
         .pipe(hashStream)
         .pipe(untarStream)
-        .on('end', () => {
+        .on('finish', () => {
           const expectHash = this.hash;
+          invariant(expectHash, 'Commit hash required');
+
           const actualHash = hashStream.getHash();
-          if (!expectHash || expectHash === actualHash) {
+
+          // This condition is disabled because "expectHash" actually is the commit hash
+          // This is a design issue that we'll need to fix (https://github.com/yarnpkg/yarn/pull/3449)
+          if (true || !expectHash || expectHash === actualHash) {
             resolve({
-              hash: actualHash,
-              resolved: `${pathname}#${actualHash}`,
+              hash: expectHash,
             });
           } else {
-            reject(new SecurityError(
-              `Bad hash. Expected ${expectHash} but got ${actualHash} `,
-            ));
+            reject(new SecurityError(this.reporter.lang('fetchBadHash', expectHash, actualHash)));
           }
         })
         .on('error', function(err) {
-          let msg = `${err.message}. `;
-          msg += `Mirror tarball appears to be corrupt. You can resolve this by running:\n\n` +
-            `  $ rm -rf ${localTarball}\n` +
-            '  $ yarn install';
-          reject(new MessageError(msg));
+          reject(new MessageError(this.reporter.lang('fetchErrorCorrupt', err.message, tarballPath)));
         });
     });
   }
@@ -69,27 +128,32 @@ export default class GitFetcher extends BaseFetcher {
     const hash = this.hash;
     invariant(hash, 'Commit hash required');
 
-    const git = new Git(this.config, this.reference, hash);
-    await git.initRemote();
+    const gitUrl = Git.npmUrlToGitUrl(this.reference);
+    const git = new Git(this.config, gitUrl, hash);
+    await git.init();
     await git.clone(this.dest);
 
-    let tarballInMirrorPath = this.config.getOfflineMirrorPath(this.reference);
-    const mirrorRootPath = this.config.getOfflineMirrorPath();
-    if (tarballInMirrorPath && this.hash && mirrorRootPath) {
-      tarballInMirrorPath = `${tarballInMirrorPath}-${this.hash}`;
-      const hash = await git.archive(tarballInMirrorPath);
-      const relativeMirrorPath = path.relative(mirrorRootPath, tarballInMirrorPath);
-      return {
-        hash,
-        resolved: relativeMirrorPath ? `${relativeMirrorPath}#${hash}` : null,
-      };
+    const tarballMirrorPath = this.getTarballMirrorPath();
+    const tarballCachePath = this.getTarballCachePath();
+
+    if (tarballMirrorPath) {
+      await git.archive(tarballMirrorPath);
+    }
+
+    if (tarballCachePath) {
+      await git.archive(tarballCachePath);
     }
 
     return {
       hash,
-      resolved: null,
     };
   }
 
-
+  async _fetch(): Promise<FetchedOverride> {
+    if (await this.getLocalAvailabilityStatus()) {
+      return this.fetchFromLocal();
+    } else {
+      return this.fetchFromExternal();
+    }
+  }
 }

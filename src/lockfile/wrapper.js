@@ -19,13 +19,13 @@ type Dependencies = {
   [key: string]: string,
 };
 
-type LockManifest = {
+export type LockManifest = {
   name: string,
   version: string,
   resolved: string,
   registry: RegistryNames,
   uid: string,
-  permissions: ?{ [key: string]: boolean },
+  permissions: ?{[key: string]: boolean},
   optionalDependencies: ?Dependencies,
   dependencies: ?Dependencies,
 };
@@ -36,7 +36,7 @@ type MinimalLockManifest = {
   resolved: string,
   registry: ?RegistryNames,
   uid: ?string,
-  permissions: ?{ [key: string]: boolean },
+  permissions: ?{[key: string]: boolean},
   optionalDependencies: ?Dependencies,
   dependencies: ?Dependencies,
 };
@@ -83,18 +83,19 @@ export default class Lockfile {
   source: string;
 
   cache: ?{
-    [key: string]: string | LockManifest
+    [key: string]: LockManifest,
   };
 
   static async fromDirectory(dir: string, reporter?: Reporter): Promise<Lockfile> {
     // read the manifest in this directory
     const lockfileLoc = path.join(dir, constants.LOCKFILE_FILENAME);
+
     let lockfile;
     let rawLockfile = '';
 
     if (await fs.exists(lockfileLoc)) {
       rawLockfile = await fs.readFile(lockfileLoc);
-      lockfile = parse(rawLockfile);
+      lockfile = parse(rawLockfile, lockfileLoc);
     } else {
       if (reporter) {
         reporter.info(reporter.lang('noLockfileFound'));
@@ -122,9 +123,15 @@ export default class Lockfile {
     return undefined;
   }
 
-  getLockfile(patterns: {
-    [packagePattern: string]: Manifest
-  }): Object {
+  removePattern(pattern: string) {
+    const cache = this.cache;
+    if (!cache) {
+      return;
+    }
+    delete cache[pattern];
+  }
+
+  getLockfile(patterns: {[packagePattern: string]: Manifest}): Object {
     const lockfile = {};
     const seen: Map<string, Object> = new Map();
 

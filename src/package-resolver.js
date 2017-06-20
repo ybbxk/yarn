@@ -5,21 +5,27 @@ import type {RegistryNames} from './registries/index.js';
 import type PackageReference from './package-reference.js';
 import type {Reporter} from './reporters/index.js';
 import type Config from './config.js';
-import {REMOVED_ANCESTOR} from './package-reference.js';
 import PackageRequest from './package-request.js';
 import RequestManager from './util/request-manager.js';
 import BlockingQueue from './util/blocking-queue.js';
 import Lockfile from './lockfile/wrapper.js';
 import map from './util/map.js';
+import WorkspaceLayout from './workspace-layout.js';
 
 const invariant = require('invariant');
+const semver = require('semver');
+
+export type ResolverOptions = {|
+  isFlat?: boolean,
+  isFrozen?: boolean,
+  workspaceLayout?: WorkspaceLayout,
+|};
 
 export default class PackageResolver {
   constructor(config: Config, lockfile: Lockfile) {
     this.patternsByPackage = map();
     this.fetchingPatterns = map();
     this.fetchingQueue = new BlockingQueue('resolver fetching');
-    this.newPatterns = [];
     this.patterns = map();
     this.usedRegistries = new Set();
     this.flat = false;
@@ -27,10 +33,15 @@ export default class PackageResolver {
     this.reporter = config.reporter;
     this.lockfile = lockfile;
     this.config = config;
+    this.delayedResolveQueue = [];
   }
 
   // whether the dependency graph will be flattened
   flat: boolean;
+
+  frozen: boolean;
+
+  workspaceLayout: ?WorkspaceLayout;
 
   // list of registries that have been used in this resolution
   usedRegistries: Set<RegistryNames>;
@@ -38,30 +49,23 @@ export default class PackageResolver {
   // activity monitor
   activity: ?{
     tick: (name: string) => void,
-    end: () => void
+    end: () => void,
   };
 
   // patterns we've already resolved or are in the process of resolving
   fetchingPatterns: {
-    [key: string]: true
+    [key: string]: true,
   };
-
-  // new patterns that didn't exist in the lockfile
-  newPatterns: Array<string>;
 
   // TODO
   fetchingQueue: BlockingQueue;
-
-  // these are patterns that the package resolver was seeded with. these are required in
-  // order to resolve top level peerDependencies
-  seedPatterns: Array<string>;
 
   // manages and throttles json api http requests
   requestManager: RequestManager;
 
   // list of patterns associated with a package
   patternsByPackage: {
-    [packageName: string]: Array<string>
+    [packageName: string]: Array<string>,
   };
 
   // lockfile instance which we can use to retrieve version info
@@ -69,7 +73,7 @@ export default class PackageResolver {
 
   // a map of dependency patterns to packages
   patterns: {
-    [packagePattern: string]: Manifest
+    [packagePattern: string]: Manifest,
   };
 
   // reporter instance, abstracts out display logic
@@ -78,17 +82,17 @@ export default class PackageResolver {
   // environment specific config methods and options
   config: Config;
 
+  // list of packages need to be resolved later (they found a matching version in the
+  // resolver, but better matches can still arrive later in the resolve process)
+  delayedResolveQueue: Array<{req: PackageRequest, info: Manifest}>;
+
   /**
    * TODO description
    */
 
   isNewPattern(pattern: string): boolean {
-    return this.newPatterns.indexOf(pattern) >= 0;
+    return !!this.patterns[pattern].fresh;
   }
-
-  /**
-   * TODO description
-   */
 
   updateManifest(ref: PackageReference, newPkg: Manifest): Promise<void> {
     // inherit fields
@@ -96,10 +100,23 @@ export default class PackageResolver {
     newPkg._reference = ref;
     newPkg._remote = ref.remote;
     newPkg.name = oldPkg.name;
+    newPkg.fresh = oldPkg.fresh;
 
     // update patterns
     for (const pattern of ref.patterns) {
       this.patterns[pattern] = newPkg;
+    }
+
+    return Promise.resolve();
+  }
+
+  updateManifests(newPkgs: Array<Manifest>): Promise<void> {
+    for (const newPkg of newPkgs) {
+      if (newPkg._reference) {
+        for (const pattern of newPkg._reference.patterns) {
+          this.patterns[pattern] = newPkg;
+        }
+      }
     }
 
     return Promise.resolve();
@@ -223,23 +240,6 @@ export default class PackageResolver {
   }
 
   /**
-   * Get a flat list of all package references.
-   */
-
-  getPackageReferences(): Array<PackageReference> {
-    const refs = [];
-
-    for (const manifest of this.getManifests()) {
-      const ref = manifest._reference;
-      if (ref) {
-        refs.push(ref);
-      }
-    }
-
-    return refs;
-  }
-
-  /**
    * Get a flat list of all package info.
    */
 
@@ -258,6 +258,19 @@ export default class PackageResolver {
     }
 
     return infos;
+  }
+
+  /**
+   * replace pattern in resolver, e.g. `name` is replaced with `name@^1.0.1`
+   */
+  replacePattern(pattern: string, newPattern: string) {
+    const pkg = this.getResolvedPattern(pattern);
+    invariant(pkg, `missing package ${pattern}`);
+    const ref = pkg._reference;
+    invariant(ref, 'expected package reference');
+    ref.patterns = [newPattern];
+    this.addPattern(newPattern, pkg);
+    this.removePattern(pattern);
   }
 
   /**
@@ -281,6 +294,7 @@ export default class PackageResolver {
         break;
       }
     }
+
     invariant(
       collapseToReference && collapseToManifest && collapseToPattern,
       `Couldn't find package manifest for ${human}`,
@@ -296,12 +310,7 @@ export default class PackageResolver {
       const ref = this.getStrictResolvedPattern(pattern)._reference;
       invariant(ref, 'expected package reference');
       const refPatterns = ref.patterns.slice();
-      ref.addVisibility(REMOVED_ANCESTOR);
       ref.prune();
-
-      for (const action in ref.visibility) {
-        collapseToReference.visibility[action] += ref.visibility[action];
-      }
 
       // add pattern to the manifest we're collapsing to
       for (const pattern of refPatterns) {
@@ -319,7 +328,7 @@ export default class PackageResolver {
   addPattern(pattern: string, info: Manifest) {
     this.patterns[pattern] = info;
 
-    const byName = this.patternsByPackage[info.name] = this.patternsByPackage[info.name] || [];
+    const byName = (this.patternsByPackage[info.name] = this.patternsByPackage[info.name] || []);
     byName.push(pattern);
   }
 
@@ -381,6 +390,35 @@ export default class PackageResolver {
   }
 
   /**
+   * Get the manifest of the highest known version that satisfies a package range
+   */
+
+  getHighestRangeVersionMatch(name: string, range: string): ?Manifest {
+    const patterns = this.patternsByPackage[name];
+    if (!patterns) {
+      return null;
+    }
+
+    const versionNumbers = [];
+    const resolvedPatterns = patterns.map((pattern): Manifest => {
+      const info = this.getStrictResolvedPattern(pattern);
+      versionNumbers.push(info.version);
+
+      return info;
+    });
+
+    const maxValidRange = semver.maxSatisfying(versionNumbers, range);
+    if (!maxValidRange) {
+      return null;
+    }
+
+    const indexOfmaxValidRange = versionNumbers.indexOf(maxValidRange);
+    const maxValidRangeManifest = resolvedPatterns[indexOfmaxValidRange];
+
+    return maxValidRangeManifest;
+  }
+
+  /**
    * TODO description
    */
 
@@ -396,37 +434,71 @@ export default class PackageResolver {
       this.activity.tick(req.pattern);
     }
 
-    if (!this.lockfile.getLocked(req.pattern, true)) {
-      this.newPatterns.push(req.pattern);
-    }
-
-    // propagate `visibility` option
-    const {parentRequest} = req;
-    if (parentRequest && parentRequest.visibility) {
-      req.visibility = parentRequest.visibility;
+    const lockfileEntry = this.lockfile.getLocked(req.pattern);
+    let fresh = false;
+    if (lockfileEntry) {
+      const {range, hasVersion} = PackageRequest.normalizePattern(req.pattern);
+      // lockfileEntry is incorrect, remove it from lockfile cache and consider the pattern as new
+      if (
+        semver.validRange(range) &&
+        semver.valid(lockfileEntry.version) &&
+        !semver.satisfies(lockfileEntry.version, range) &&
+        !PackageRequest.getExoticResolver(range) &&
+        hasVersion
+      ) {
+        this.reporter.warn(this.reporter.lang('incorrectLockfileEntry', req.pattern));
+        this.removePattern(req.pattern);
+        this.lockfile.removePattern(req.pattern);
+        fresh = true;
+      }
+    } else {
+      fresh = true;
     }
 
     const request = new PackageRequest(req, this);
-    await request.find();
+    await request.find({fresh, frozen: this.frozen});
   }
 
   /**
    * TODO description
    */
 
-  async init(deps: DependencyRequestPatterns, isFlat: boolean): Promise<void> {
-    this.flat = isFlat;
-
-    //
-    const activity = this.activity = this.reporter.activity();
-
-    //
-    this.seedPatterns = deps.map((dep): string => dep.pattern);
-
-    //
+  async init(
+    deps: DependencyRequestPatterns,
+    {isFlat, isFrozen, workspaceLayout}: ResolverOptions = {isFlat: false, isFrozen: false, workspaceLayout: undefined},
+  ): Promise<void> {
+    this.flat = Boolean(isFlat);
+    this.frozen = Boolean(isFrozen);
+    this.workspaceLayout = workspaceLayout;
+    const activity = (this.activity = this.reporter.activity());
     await Promise.all(deps.map((req): Promise<void> => this.find(req)));
+
+    // all required package versions have been discovered, so now packages that
+    // resolved to existing versions can be resolved to their best available version
+    this.resolvePackagesWithExistingVersions();
 
     activity.end();
     this.activity = null;
+  }
+
+  /**
+    * Called by the package requester for packages that this resolver already had
+    * a matching version for. Delay the resolve, because better matches can still be
+    * discovered.
+    */
+
+  reportPackageWithExistingVersion(req: PackageRequest, info: Manifest) {
+    this.delayedResolveQueue.push({req, info});
+  }
+
+  /**
+    * Executes the resolve to existing versions for packages after the find process,
+    * when all versions that are going to be used have been discovered.
+    */
+
+  resolvePackagesWithExistingVersions() {
+    for (const {req, info} of this.delayedResolveQueue) {
+      req.resolveToExistingVersion(info);
+    }
   }
 }

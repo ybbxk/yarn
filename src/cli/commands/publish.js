@@ -2,14 +2,13 @@
 
 import type {Reporter} from '../../reporters/index.js';
 import type Config from '../../config.js';
-import executeLifecycleScript from './_execute-lifecycle-script.js';
 import NpmRegistry from '../../registries/npm-registry.js';
-import {ConcatStream} from '../../util/stream.js';
 import {MessageError} from '../../errors.js';
 import {setVersion, setFlags as versionSetFlags} from './version.js';
 import * as fs from '../../util/fs.js';
 import {pack} from './pack.js';
 import {getToken} from './login.js';
+import {has2xxResponse} from '../../util/misc.js';
 
 const invariant = require('invariant');
 const crypto = require('crypto');
@@ -23,12 +22,11 @@ export function setFlags(commander: Object) {
   commander.option('--tag [tag]', 'tag');
 }
 
-async function publish(
-  config: Config,
-  pkg: any,
-  flags: Object,
-  dir: string,
-): Promise<void> {
+export function hasWrapper(): boolean {
+  return true;
+}
+
+async function publish(config: Config, pkg: any, flags: Object, dir: string): Promise<void> {
   // validate access argument
   const access = flags.access;
   if (access && access !== 'public' && access !== 'restricted') {
@@ -45,9 +43,10 @@ async function publish(
   } else {
     throw new Error("Don't know how to handle this file type");
   }
-  invariant(stream, 'expected stream');
   const buffer = await new Promise((resolve, reject) => {
-    stream.pipe(new ConcatStream(resolve)).on('error', reject);
+    const data = [];
+    invariant(stream, 'expected stream');
+    stream.on('data', data.push.bind(data)).on('end', () => resolve(Buffer.concat(data))).on('error', reject);
   });
 
   // copy normalized package and remove internal keys as they may be sensitive or yarn specific
@@ -63,7 +62,9 @@ async function publish(
   const tbURI = `${pkg.name}/-/${tbName}`;
 
   // TODO this might modify package.json, do we need to reload it?
-  await executeLifecycleScript(config, 'prepublish');
+  await config.executeLifecycleScript('prepublish');
+  await config.executeLifecycleScript('prepublishOnly');
+  await config.executeLifecycleScript('prepare');
 
   // create body
   const root = {
@@ -80,7 +81,7 @@ async function publish(
     readme: pkg.readme || '',
     _attachments: {
       [tbName]: {
-        'content_type': 'application/octet-stream',
+        content_type: 'application/octet-stream',
         data: buffer.toString('base64'),
         length: buffer.length,
       },
@@ -100,20 +101,15 @@ async function publish(
     body: root,
   });
 
-  if (res != null && res.success) {
-    await executeLifecycleScript(config, 'publish');
-    await executeLifecycleScript(config, 'postpublish');
+  if (res !== null && has2xxResponse(res)) {
+    await config.executeLifecycleScript('publish');
+    await config.executeLifecycleScript('postpublish');
   } else {
     throw new MessageError(config.reporter.lang('publishFail'));
   }
 }
 
-export async function run(
- config: Config,
- reporter: Reporter,
- flags: Object,
- args: Array<string>,
-): Promise<void> {
+export async function run(config: Config, reporter: Reporter, flags: Object, args: Array<string>): Promise<void> {
   // validate package fields that are required for publishing
   const pkg = await config.readRootManifest();
   if (pkg.private) {
@@ -128,7 +124,7 @@ export async function run(
   if (args.length > 1) {
     throw new MessageError(reporter.lang('tooManyArguments', 1));
   }
-  if (!(await fs.exists(dir))) {
+  if (!await fs.exists(dir)) {
     throw new MessageError(reporter.lang('unknownFolderOrTarball'));
   }
 

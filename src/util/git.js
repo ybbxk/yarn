@@ -1,6 +1,7 @@
 /* @flow */
 
 import type Config from '../config.js';
+import type {Reporter} from '../reporters/index.js';
 import {MessageError, SecurityError} from '../errors.js';
 import {removeSuffix} from './misc.js';
 import * as crypto from './crypto.js';
@@ -10,102 +11,177 @@ import map from './map.js';
 
 const invariant = require('invariant');
 const semver = require('semver');
+const StringDecoder = require('string_decoder').StringDecoder;
+const tarFs = require('tar-fs');
+const tarStream = require('tar-stream');
 const url = require('url');
-const tar = require('tar');
 import {createWriteStream} from 'fs';
 
 type GitRefs = {
-  [name: string]: string
+  [name: string]: string,
 };
 
-const supportsArchiveCache: { [key: string]: ?boolean } = map({
+type GitUrl = {
+  protocol: string, // parsed from URL
+  hostname: ?string,
+  repository: string, // git-specific "URL"
+};
+
+const supportsArchiveCache: {[key: string]: boolean} = map({
   'github.com': false, // not support, doubt they will ever support it
 });
 
-export default class Git {
-  constructor(config: Config, url: string, hash: string) {
-    Git.assertUrl(url, hash);
+// Suppress any password prompts since we run these in the background
+const env = {GIT_ASKPASS: '', GIT_TERMINAL_PROMPT: 0, GIT_SSH_COMMAND: 'ssh -oBatchMode=yes'};
 
+// This regex is designed to match output from git of the style:
+//   ebeb6eafceb61dd08441ffe086c77eb472842494  refs/tags/v0.21.0
+// and extract the hash and tag name as capture groups
+const gitRefLineRegex = /^([a-fA-F0-9]+)\s+(?:[^/]+\/){2}(.*)$/;
+
+export default class Git {
+  constructor(config: Config, gitUrl: GitUrl, hash: string) {
     this.supportsArchive = false;
     this.fetched = false;
     this.config = config;
+    this.reporter = config.reporter;
     this.hash = hash;
     this.ref = hash;
-    this.url = Git.cleanUrl(url);
-    this.cwd = this.config.getTemp(crypto.hash(this.url));
+    this.gitUrl = gitUrl;
+    this.cwd = this.config.getTemp(crypto.hash(this.gitUrl.repository));
   }
 
   supportsArchive: boolean;
   fetched: boolean;
   config: Config;
+  reporter: Reporter;
   hash: string;
   ref: string;
   cwd: string;
-  url: string;
+  gitUrl: GitUrl;
 
+  /**
+   * npm URLs contain a 'git+' scheme prefix, which is not understood by git.
+   * git "URLs" also allow an alternative scp-like syntax, so they're not standard URLs.
+   */
+  static npmUrlToGitUrl(npmUrl: string): GitUrl {
+    // Expand shortened format first if needed
+    npmUrl = npmUrl.replace(/^github:/, 'git+ssh://git@github.com/');
 
-  static cleanUrl(url): string {
-    return url.replace(/^git\+/, '');
+    // Special case in npm, where ssh:// prefix is stripped to pass scp-like syntax
+    // which in git works as remote path only if there are no slashes before ':'.
+    const match = npmUrl.match(/^git\+ssh:\/\/((?:[^@:\/]+@)?([^@:\/]+):([^/]*).*)/);
+    // Additionally, if the host part is digits-only, npm falls back to
+    // interpreting it as an SSH URL with a port number.
+    if (match && /[^0-9]/.test(match[3])) {
+      return {
+        hostname: match[2],
+        protocol: 'ssh:',
+        repository: match[1],
+      };
+    }
+
+    const repository = npmUrl.replace(/^git\+/, '');
+    const parsed = url.parse(repository);
+    return {
+      hostname: parsed.hostname || null,
+      protocol: parsed.protocol || 'file:',
+      repository,
+    };
+  }
+
+  static spawn(args: Array<string>, opts?: child_process$spawnOpts = {}): Promise<string> {
+    return child.spawn('git', args, {...opts, env});
   }
 
   /**
    * Check if the host specified in the input `gitUrl` has archive capability.
    */
 
-  static async hasArchiveCapability(gitUrl: string): Promise<boolean> {
-    // USER@HOSTNAME:PATHNAME
-    const match = gitUrl.match(/^(.*?)@(.*?):(.*?)$/);
-    if (!match) {
+  static async hasArchiveCapability(ref: GitUrl): Promise<boolean> {
+    const hostname = ref.hostname;
+    if (ref.protocol !== 'ssh:' || hostname == null) {
       return false;
     }
 
-    const [,, hostname] = match;
-    const cached = supportsArchiveCache[hostname];
-    if (cached != null) {
-      return cached;
+    if (hostname in supportsArchiveCache) {
+      return supportsArchiveCache[hostname];
     }
 
     try {
-      await child.spawn('git', ['archive', `--remote=${gitUrl}`, 'HEAD', Date.now() + '']);
+      await Git.spawn(['archive', `--remote=${ref.repository}`, 'HEAD', Date.now() + '']);
       throw new Error();
     } catch (err) {
       const supports = err.message.indexOf('did not match any files') >= 0;
-      return supportsArchiveCache[hostname] = supports;
+      return (supportsArchiveCache[hostname] = supports);
     }
   }
 
   /**
-   * Check if the input `target` is a 40 character hex commit hash.
+   * Check if the input `target` is a 5-40 character hex commit hash.
    */
 
   static isCommitHash(target: string): boolean {
     return !!target && /^[a-f0-9]{5,40}$/.test(target);
   }
 
-  /**
-   * Assert that a URL is safe to fetch from. Forbid insecure URLs like plain HTTP with no
-   * hash.
-   */
+  static async repoExists(ref: GitUrl): Promise<boolean> {
+    try {
+      await Git.spawn(['ls-remote', '-t', ref.repository]);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
 
-  static assertUrl(ref: string, hash: string) {
+  static replaceProtocol(ref: GitUrl, protocol: string): GitUrl {
+    return {
+      hostname: ref.hostname,
+      protocol,
+      repository: ref.repository.replace(/^(?:git|http):/, protocol),
+    };
+  }
+
+  /**
+   * Attempt to upgrade insecure protocols to secure protocol
+   */
+  static async secureGitUrl(ref: GitUrl, hash: string, reporter: Reporter): Promise<GitUrl> {
     if (Git.isCommitHash(hash)) {
       // this is cryptographically secure
-      return;
+      return ref;
     }
 
-    const parts = url.parse(ref);
-
-    if (parts.protocol === 'git') {
-      throw new SecurityError(
-        `Refusing to download the git repo ${ref} over plain git without a commit hash`,
-      );
+    if (ref.protocol === 'git:') {
+      const secureUrl = Git.replaceProtocol(ref, 'https:');
+      if (await Git.repoExists(secureUrl)) {
+        return secureUrl;
+      } else {
+        throw new SecurityError(reporter.lang('refusingDownloadGitWithoutCommit', ref));
+      }
     }
 
-    if (parts.protocol === 'http:') {
-      throw new SecurityError(
-        `Refusing to download the git repo ${ref} over HTTP without a commit hash`,
-      );
+    if (ref.protocol === 'http:') {
+      const secureRef = Git.replaceProtocol(ref, 'https:');
+      if (await Git.repoExists(secureRef)) {
+        return secureRef;
+      } else {
+        if (await Git.repoExists(ref)) {
+          return ref;
+        } else {
+          throw new SecurityError(reporter.lang('refusingDownloadHTTPWithoutCommit', ref));
+        }
+      }
     }
+
+    if (ref.protocol === 'https:') {
+      if (await Git.repoExists(ref)) {
+        return ref;
+      } else {
+        throw new SecurityError(reporter.lang('refusingDownloadHTTPSWithoutCommit', ref));
+      }
+    }
+
+    return ref;
   }
 
   /**
@@ -122,7 +198,7 @@ export default class Git {
 
   async _archiveViaRemoteArchive(dest: string): Promise<string> {
     const hashStream = new crypto.HashStream();
-    await child.spawn('git', ['archive', `--remote=${this.url}`, this.ref], {
+    await Git.spawn(['archive', `--remote=${this.gitUrl.repository}`, this.ref], {
       process(proc, resolve, reject, done) {
         const writeStream = createWriteStream(dest);
         proc.on('error', reject);
@@ -139,7 +215,7 @@ export default class Git {
 
   async _archiveViaLocalFetched(dest: string): Promise<string> {
     const hashStream = new crypto.HashStream();
-    await child.spawn('git', ['archive', this.hash], {
+    await Git.spawn(['archive', this.hash], {
       cwd: this.cwd,
       process(proc, resolve, reject, done) {
         const writeStream = createWriteStream(dest);
@@ -168,11 +244,14 @@ export default class Git {
   }
 
   async _cloneViaRemoteArchive(dest: string): Promise<void> {
-    await child.spawn('git', ['archive', `--remote=${this.url}`, this.ref], {
+    await Git.spawn(['archive', `--remote=${this.gitUrl.repository}`, this.ref], {
       process(proc, update, reject, done) {
-        const extractor = tar.Extract({path: dest});
+        const extractor = tarFs.extract(dest, {
+          dmode: 0o555, // all dirs should be readable
+          fmode: 0o444, // all files should be readable
+        });
         extractor.on('error', reject);
-        extractor.on('end', done);
+        extractor.on('finish', done);
 
         proc.stdout.pipe(extractor);
         proc.on('error', reject);
@@ -181,12 +260,16 @@ export default class Git {
   }
 
   async _cloneViaLocalFetched(dest: string): Promise<void> {
-    await child.spawn('git', ['archive', this.hash], {
+    await Git.spawn(['archive', this.hash], {
       cwd: this.cwd,
       process(proc, resolve, reject, done) {
-        const extractor = tar.Extract({path: dest});
+        const extractor = tarFs.extract(dest, {
+          dmode: 0o555, // all dirs should be readable
+          fmode: 0o444, // all files should be readable
+        });
+
         extractor.on('error', reject);
-        extractor.on('end', done);
+        extractor.on('finish', done);
 
         proc.stdout.pipe(extractor);
       },
@@ -198,13 +281,13 @@ export default class Git {
    */
 
   fetch(): Promise<void> {
-    const {url, cwd} = this;
+    const {gitUrl, cwd} = this;
 
-    return fs.lockQueue.push(url, async () => {
+    return fs.lockQueue.push(gitUrl.repository, async () => {
       if (await fs.exists(cwd)) {
-        await child.spawn('git', ['pull'], {cwd});
+        await Git.spawn(['pull'], {cwd});
       } else {
-        await child.spawn('git', ['clone', url, cwd]);
+        await Git.spawn(['clone', gitUrl.repository, cwd]);
       }
 
       this.fetched = true;
@@ -222,10 +305,12 @@ export default class Git {
       return 'master';
     }
 
-    return await this.config.resolveConstraints(
-      tags.filter((tag): boolean => !!semver.valid(tag, this.config.looseSemver)),
-      range,
-    ) || range;
+    return (
+      (await this.config.resolveConstraints(
+        tags.filter((tag): boolean => !!semver.valid(tag, this.config.looseSemver)),
+        range,
+      )) || range
+    );
   }
 
   /**
@@ -242,15 +327,27 @@ export default class Git {
 
   async _getFileFromArchive(filename: string): Promise<string | false> {
     try {
-      return await child.spawn('git', ['archive', `--remote=${this.url}`, this.ref, filename], {
+      return await Git.spawn(['archive', `--remote=${this.gitUrl.repository}`, this.ref, filename], {
         process(proc, update, reject, done) {
-          const parser = tar.Parse();
+          const parser = tarStream.extract();
 
           parser.on('error', reject);
-          parser.on('end', done);
+          parser.on('finish', done);
 
-          parser.on('data', (entry: Buffer) => {
-            update(entry.toString());
+          parser.on('entry', (header, stream, next) => {
+            const decoder = new StringDecoder('utf8');
+            let fileContent = '';
+
+            stream.on('data', buffer => {
+              fileContent += decoder.write(buffer);
+            });
+            stream.on('end', () => {
+              // $FlowFixMe: suppressing this error due to bug https://github.com/facebook/flow/pull/3483
+              const remaining: string = decoder.end();
+              update(fileContent + remaining);
+              next();
+            });
+            stream.resume();
           });
 
           proc.stdout.pipe(parser);
@@ -269,7 +366,9 @@ export default class Git {
     invariant(this.fetched, 'Repo not fetched');
 
     try {
-      return await child.spawn('git', ['show', `${this.hash}:${filename}`], {cwd: this.cwd});
+      return await Git.spawn(['show', `${this.hash}:${filename}`], {
+        cwd: this.cwd,
+      });
     } catch (err) {
       // file doesn't exist
       return false;
@@ -277,24 +376,25 @@ export default class Git {
   }
 
   /**
-   * Try and find a ref from this repo that matches an input `target`.
+   * Initialize the repo, find a secure url to use and
+   * set the ref to match an input `target`.
    */
-
-  async initRemote(): Promise<string> {
+  async init(): Promise<string> {
+    this.gitUrl = await Git.secureGitUrl(this.gitUrl, this.hash, this.reporter);
     // check capabilities
-    if (await Git.hasArchiveCapability(this.url)) {
+    if (await Git.hasArchiveCapability(this.gitUrl)) {
       this.supportsArchive = true;
     } else {
       await this.fetch();
     }
 
-    return await this.setRefRemote();
+    return this.setRefRemote();
   }
 
   async setRefRemote(): Promise<string> {
-    const stdout = await child.spawn('git', ['ls-remote', '--tags', '--heads', this.url]);
+    const stdout = await Git.spawn(['ls-remote', '--tags', '--heads', this.gitUrl.repository]);
     const refs = Git.parseRefs(stdout);
-    return await this.setRef(refs);
+    return this.setRef(refs);
   }
 
   /**
@@ -317,21 +417,26 @@ export default class Git {
 
       // `git archive` only accepts a treeish and we have no ref to this commit
       this.supportsArchive = false;
-      return this.ref = this.hash = hash;
+
+      if (!this.fetched) {
+        // in fact, `git archive` can't be used, and we haven't fetched the project yet. Do it now.
+        await this.fetch();
+      }
+      return (this.ref = this.hash = hash);
     }
 
     const ref = await this.findResolution(hash, names);
     const commit = refs[ref];
     if (commit) {
       this.ref = ref;
-      return this.hash = commit;
+      return (this.hash = commit);
     } else {
-      throw new MessageError(this.config.reporter.lang('couldntFindMatch', ref, names.join(','), this.url));
+      throw new MessageError(this.reporter.lang('couldntFindMatch', ref, names.join(','), this.gitUrl.repository));
     }
   }
 
   /**
-   * TODO description
+   * Parse Git ref lines into hash of tag names to SHA hashes
    */
 
   static parseRefs(stdout: string): GitRefs {
@@ -342,14 +447,21 @@ export default class Git {
     const refLines = stdout.split('\n');
 
     for (const line of refLines) {
-      // line example: 64b2c0cee9e829f73c5ad32b8cc8cb6f3bec65bb refs/tags/v4.2.2
-      const [sha, id] = line.split(/\s+/g);
-      let name = id.split('/').slice(2).join('/');
+      const match = gitRefLineRegex.exec(line);
 
-      // TODO: find out why this is necessary. idk it makes it work...
-      name = removeSuffix(name, '^{}');
+      if (match) {
+        const [, sha, tagName] = match;
 
-      refs[name] = sha;
+        // As documented in gitrevisions:
+        //   https://www.kernel.org/pub/software/scm/git/docs/gitrevisions.html#_specifying_revisions
+        // "A suffix ^ followed by an empty brace pair means the object could be a tag,
+        //   and dereference the tag recursively until a non-tag object is found."
+        // In other words, the hash without ^{} is the hash of the tag,
+        //   and the hash with ^{} is the hash of the commit at which the tag was made.
+        const name = removeSuffix(tagName, '^{}');
+
+        refs[name] = sha;
+      }
     }
 
     return refs;

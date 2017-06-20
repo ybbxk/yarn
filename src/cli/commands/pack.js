@@ -4,26 +4,26 @@ import type {Reporter} from '../../reporters/index.js';
 import type Config from '../../config.js';
 import type {IgnoreFilter} from '../../util/filter.js';
 import * as fs from '../../util/fs.js';
-import {sortFilter, ignoreLinesToRegex} from '../../util/filter.js';
+import {sortFilter, ignoreLinesToRegex, filterOverridenGitignores} from '../../util/filter.js';
 import {MessageError} from '../../errors.js';
 
 const zlib = require('zlib');
 const path = require('path');
-const tar = require('tar-stream');
+const tar = require('tar-fs');
 const fs2 = require('fs');
 
-const IGNORE_FILENAMES = [
-  '.yarnignore',
-  '.npmignore',
-  '.gitignore',
-];
-
-const DEFAULT_IGNORE = ignoreLinesToRegex([
+const FOLDERS_IGNORE = [
   // never allow version control folders
   '.git',
   'CVS',
   '.svn',
   '.hg',
+
+  'node_modules',
+];
+
+const DEFAULT_IGNORE = ignoreLinesToRegex([
+  ...FOLDERS_IGNORE,
 
   // ignore cruft
   'yarn.lock',
@@ -38,73 +38,66 @@ const DEFAULT_IGNORE = ignoreLinesToRegex([
   '.npmignore',
   '.gitignore',
   '.DS_Store',
-  'node_modules',
-
-  // never ignore these files
-  '!package.json',
-  '!readme*',
-  '!+(license|licence)*',
-  '!+(changes|changelog|history)*',
 ]);
 
-function addEntry(packer: any, entry: Object, buffer?: ?Buffer): Promise<void> {
-  return new Promise((resolve, reject) => {
-    packer.entry(entry, buffer, function(err) {
-      if (err) {
-        reject(err);
-      } else {
-        resolve();
-      }
-    });
-  });
-}
+const NEVER_IGNORE = ignoreLinesToRegex([
+  // never ignore these files
+  '!/package.json',
+  '!/readme*',
+  '!/+(license|licence)*',
+  '!/+(changes|changelog|history)*',
+]);
 
 export async function pack(config: Config, dir: string): Promise<stream$Duplex> {
   const pkg = await config.readRootManifest();
+  const {bundledDependencies, main, files: onlyFiles} = pkg;
 
-  //
-  let filters: Array<IgnoreFilter> = DEFAULT_IGNORE.slice();
+  // include required files
+  let filters: Array<IgnoreFilter> = NEVER_IGNORE.slice();
+  // include default filters unless `files` is used
+  if (!onlyFiles) {
+    filters = filters.concat(DEFAULT_IGNORE);
+  }
+  if (main) {
+    filters = filters.concat(ignoreLinesToRegex(['!/' + main]));
+  }
 
   // include bundledDependencies
-  const {bundledDependencies} = pkg;
   if (bundledDependencies) {
     const folder = config.getFolder(pkg);
-    filters = ignoreLinesToRegex(
-      bundledDependencies.map((name): string => `!${folder}/${name}`),
-      '.',
-    );
+    filters = ignoreLinesToRegex(bundledDependencies.map((name): string => `!${folder}/${name}`), '.');
   }
 
   // `files` field
-  const {files: onlyFiles} = pkg;
   if (onlyFiles) {
     let lines = [
       '*', // ignore all files except those that are explicitly included with a negation filter
+      '.*', // files with "." as first character have to be excluded explicitly
     ];
     lines = lines.concat(
       onlyFiles.map((filename: string): string => `!${filename}`),
+      onlyFiles.map((filename: string): string => `!${path.join(filename, '**')}`),
     );
-    filters = ignoreLinesToRegex(lines, '.');
+    const regexes = ignoreLinesToRegex(lines, '.');
+    filters = filters.concat(regexes);
   }
 
-  //
-  const files = await fs.walk(config.cwd);
+  const files = await fs.walk(config.cwd, null, new Set(FOLDERS_IGNORE));
+  const dotIgnoreFiles = filterOverridenGitignores(files);
 
   // create ignores
-  for (const file of files) {
-    if (IGNORE_FILENAMES.indexOf(path.basename(file.relative)) >= 0) {
-      const raw = await fs.readFile(file.absolute);
-      const lines = raw.split('\n');
+  for (const file of dotIgnoreFiles) {
+    const raw = await fs.readFile(file.absolute);
+    const lines = raw.split('\n');
 
-      const regexes = ignoreLinesToRegex(lines, path.dirname(file.relative));
-      filters = filters.concat(regexes);
-    }
+    const regexes = ignoreLinesToRegex(lines, path.dirname(file.relative));
+    filters = filters.concat(regexes);
   }
 
-  // files to definently keep, takes precedence over ignore filter
+  // files to definitely keep, takes precedence over ignore filter
   const keepFiles: Set<string> = new Set();
 
-  // files to definently ignore
+  // files to definitely ignore
   const ignoredFiles: Set<string> = new Set();
 
   // list of files that didn't match any of our patterns, if a directory in the chain above was matched
@@ -114,60 +107,40 @@ export async function pack(config: Config, dir: string): Promise<stream$Duplex> 
   // apply filters
   sortFilter(files, filters, keepFiles, possibleKeepFiles, ignoredFiles);
 
-  const packer = tar.pack();
-  const compressor = packer.pipe(new zlib.Gzip());
-
-  await addEntry(packer, {
-    name: 'package',
-    type: 'directory',
+  const packer = tar.pack(config.cwd, {
+    ignore: name => {
+      const relative = path.relative(config.cwd, name);
+      // Don't ignore directories, since we need to recurse inside them to check for unignored files.
+      if (fs2.lstatSync(name).isDirectory()) {
+        const isParentOfKeptFile = Array.from(keepFiles).some(name => !path.relative(relative, name).startsWith('..'));
+        return !isParentOfKeptFile;
+      }
+      // Otherwise, ignore a file if we're not supposed to keep it.
+      return !keepFiles.has(relative);
+    },
+    map: header => {
+      const suffix = header.name === '.' ? '' : `/${header.name}`;
+      header.name = `package${suffix}`;
+      delete header.uid;
+      delete header.gid;
+      return header;
+    },
   });
 
-  for (const name of keepFiles) {
-    const loc = path.join(config.cwd, name);
-    const stat = await fs.lstat(loc);
-
-    let type: ?string;
-    let buffer: ?Buffer;
-    let linkname: ?string;
-    if (stat.isDirectory()) {
-      type = 'directory';
-    } else if (stat.isFile()) {
-      buffer = await fs.readFileRaw(loc);
-      type = 'file';
-    } else if (stat.isSymbolicLink()) {
-      type = 'symlink';
-      linkname = await fs.readlink(loc);
-    } else {
-      throw new Error();
-    }
-
-    const entry = {
-      name: `package/${name}`,
-      size: stat.size,
-      mode: stat.mode,
-      mtime: stat.mtime,
-      type,
-      linkname,
-    };
-
-    await addEntry(packer, entry, buffer);
-  }
-
-  packer.finalize();
+  const compressor = packer.pipe(new zlib.Gzip());
 
   return compressor;
 }
 
 export function setFlags(commander: Object) {
-  commander.option('-f, --filename [filename]', 'filename');
+  commander.option('-f, --filename <filename>', 'filename');
 }
 
-export async function run(
- config: Config,
- reporter: Reporter,
- flags: Object,
- args: Array<string>,
-): Promise<void> {
+export function hasWrapper(): boolean {
+  return true;
+}
+
+export async function run(config: Config, reporter: Reporter, flags: Object, args: Array<string>): Promise<void> {
   const pkg = await config.readRootManifest();
   if (!pkg.name) {
     throw new MessageError(reporter.lang('noName'));
@@ -176,7 +149,8 @@ export async function run(
     throw new MessageError(reporter.lang('noVersion'));
   }
 
-  const filename = flags.filename || path.join(config.cwd, `${pkg.name}-v${pkg.version}.tgz`);
+  const normaliseScope = name => (name[0] === '@' ? name.substr(1).replace('/', '-') : name);
+  const filename = flags.filename || path.join(config.cwd, `${normaliseScope(pkg.name)}-v${pkg.version}.tgz`);
 
   const stream = await pack(config, config.cwd);
 

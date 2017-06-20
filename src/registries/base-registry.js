@@ -1,5 +1,6 @@
 /* @flow */
 
+import type Reporter from '../reporters/base-reporter.js';
 import type RequestManager, {RequestMethods} from '../util/request-manager.js';
 import type Config from '../config.js';
 import type {ConfigRegistries} from './index.js';
@@ -12,17 +13,20 @@ export type RegistryRequestOptions = {
   method?: RequestMethods,
   auth?: Object,
   body?: mixed,
-  buffer?: bool,
-  process?: Function
+  buffer?: boolean,
+  headers?: Object,
+  process?: Function,
 };
 
 export type CheckOutdatedReturn = Promise<{
   wanted: string,
   latest: string,
+  url: string,
 }>;
 
 export default class BaseRegistry {
-  constructor(cwd: string, registries: ConfigRegistries, requestManager: RequestManager) {
+  constructor(cwd: string, registries: ConfigRegistries, requestManager: RequestManager, reporter: Reporter) {
+    this.reporter = reporter;
     this.requestManager = requestManager;
     this.registries = registries;
     this.config = {};
@@ -35,6 +39,8 @@ export default class BaseRegistry {
   // the filename to use for package metadata
   static filename: string;
 
+  //
+  reporter: Reporter;
   //
   registries: ConfigRegistries;
 
@@ -64,6 +70,16 @@ export default class BaseRegistry {
     return this.config[key];
   }
 
+  getAvailableRegistries(): Array<string> {
+    const config = this.config;
+    return Object.keys(config).reduce((registries, option) => {
+      if (option === 'registry' || option.split(':')[1] === 'registry') {
+        registries.push(config[option]);
+      }
+      return registries;
+    }, []);
+  }
+
   loadConfig(): Promise<void> {
     return Promise.resolve();
   }
@@ -89,20 +105,37 @@ export default class BaseRegistry {
     this.loc = path.join(this.cwd, this.folder);
   }
 
+  static normalizeConfig(config: Object): Object {
+    for (const key in config) {
+      config[key] = BaseRegistry.normalizeConfigOption(config[key]);
+    }
+    return config;
+  }
+
+  static normalizeConfigOption(val: any): any {
+    if (val === 'true') {
+      return true;
+    } else if (val === 'false') {
+      return false;
+    } else {
+      return val;
+    }
+  }
+
   mergeEnv(prefix: string) {
     // try environment variables
-    for (let key in process.env) {
-      key = key.toLowerCase();
+    for (const envKey in process.env) {
+      let key = envKey.toLowerCase();
 
       // only accept keys prefixed with the prefix
-      if (key.indexOf(prefix) < 0) {
+      if (key.indexOf(prefix.toLowerCase()) < 0) {
         continue;
       }
 
-      const val = process.env[key];
+      const val = BaseRegistry.normalizeConfigOption(process.env[envKey]);
 
-      // remove bower prefix
-      key = removePrefix(key, prefix);
+      // remove config prefix
+      key = removePrefix(key, prefix.toLowerCase());
 
       // replace dunders with dots
       key = key.replace(/__/g, '.');

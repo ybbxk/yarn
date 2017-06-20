@@ -3,6 +3,7 @@
 import type {Reporter} from '../../reporters/index.js';
 import type Config from '../../config.js';
 
+import type {HoistManifestTuple, HoistManifestTuples} from '../../package-hoister.js';
 import {Install} from './install.js';
 import {METADATA_FILENAME, TARBALL_FILENAME} from '../../constants.js';
 import * as fs from '../../util/fs.js';
@@ -11,14 +12,14 @@ import {MessageError} from '../../errors.js';
 
 export const requireLockfile = true;
 
+const invariant = require('invariant');
 const bytes = require('bytes');
 const emoji = require('node-emoji');
-const invariant = require('invariant');
 const path = require('path');
 
 async function cleanQuery(config: Config, query: string): Promise<string> {
   // if a location was passed then turn it into a hash query
-  if (path.isAbsolute(query) && await fs.exists(query)) {
+  if (path.isAbsolute(query) && (await fs.exists(query))) {
     // absolute path
     query = path.relative(config.cwd, query);
   }
@@ -29,29 +30,44 @@ async function cleanQuery(config: Config, query: string): Promise<string> {
   // remove trailing hashes
   query = query.replace(/^#+/g, '');
 
-  // remove path after last hash
-  query = query.replace(/[\\/](.*?)$/g, '');
+  // remove trailing paths from each part of the query, skip second part of path for scoped packages
+  let queryParts = query.split('#');
+  queryParts = queryParts.map((part: string): string => {
+    let parts = part.split(/[\\/]/g);
+
+    if (part[0] === '@') {
+      parts = parts.slice(0, 2);
+    } else {
+      parts = parts.slice(0, 1);
+    }
+
+    return parts.join('/');
+  });
+  query = queryParts.join('#');
 
   return query;
 }
 
-async function getPackageSize([loc, info]): Promise<number> {
-  const files = await fs.walk(loc, null, new Set([
-    METADATA_FILENAME,
-    TARBALL_FILENAME,
-  ]));
-  const sizes = await Promise.all(
-    files.map(
-      (walkFile) => fs.getFileSizeOnDisk(walkFile.absolute),
-    ),
-  );
+async function getPackageSize(tuple: HoistManifestTuple): Promise<number> {
+  const [loc] = tuple;
+
+  const files = await fs.walk(loc, null, new Set([METADATA_FILENAME, TARBALL_FILENAME]));
+
+  const sizes = await Promise.all(files.map(walkFile => fs.getFileSizeOnDisk(walkFile.absolute)));
 
   return sum(sizes);
 }
 
+function sum(array: Array<number>): number {
+  return array.length ? array.reduce((a, b) => a + b, 0) : 0;
+}
 
-const sum = (array) => array.length ? array.reduce((a, b) => a + b, 0) : 0;
-const collect = (hoistManifests, allDependencies, dependency, {recursive} = {recursive: false}) => {
+function collect(
+  hoistManifests: HoistManifestTuples,
+  allDependencies: Set<any>,
+  dependency: HoistManifestTuple,
+  {recursive}: {recursive?: boolean} = {recursive: false},
+): Set<any> {
   const [, depInfo] = dependency;
   const deps = depInfo.pkg.dependencies;
 
@@ -72,18 +88,17 @@ const collect = (hoistManifests, allDependencies, dependency, {recursive} = {rec
   }
 
   if (recursive) {
-    directDependencies.forEach(
-      (dependency) => collect(hoistManifests, allDependencies, dependency, {recursive: true}),
-    );
+    directDependencies.forEach(dependency => collect(hoistManifests, allDependencies, dependency, {recursive: true}));
   }
 
   return allDependencies;
-};
-const getSharedDependencies = (hoistManifests, transitiveKeys) => {
+}
+
+function getSharedDependencies(hoistManifests: HoistManifestTuples, transitiveKeys: Set<string>): Set<string> {
   const sharedDependencies = new Set();
   for (const [, info] of hoistManifests) {
     if (!transitiveKeys.has(info.key) && info.pkg.dependencies) {
-      Object.keys(info.pkg.dependencies).forEach((dependency) => {
+      Object.keys(info.pkg.dependencies).forEach(dependency => {
         if (transitiveKeys.has(dependency) && !sharedDependencies.has(dependency)) {
           sharedDependencies.add(dependency);
         }
@@ -91,14 +106,15 @@ const getSharedDependencies = (hoistManifests, transitiveKeys) => {
     }
   }
   return sharedDependencies;
-};
+}
 
-export async function run(
-  config: Config,
-  reporter: Reporter,
-  flags: Object,
-  args: Array<string>,
-): Promise<void> {
+export function setFlags() {}
+
+export function hasWrapper(): boolean {
+  return true;
+}
+
+export async function run(config: Config, reporter: Reporter, flags: Object, args: Array<string>): Promise<void> {
   if (!args.length) {
     throw new MessageError(reporter.lang('missingWhyDependency'));
   }
@@ -112,10 +128,10 @@ export async function run(
 
   // init
   reporter.step(2, 4, reporter.lang('whyInitGraph'), emoji.get('truck'));
-  const lockfile = await Lockfile.fromDirectory(config.cwd, reporter);
+  const lockfile = await Lockfile.fromDirectory(config.lockfileFolder, reporter);
   const install = new Install(flags, config, reporter, lockfile);
-  const [depRequests, patterns] = await install.fetchRequestFromCwd();
-  await install.resolver.init(depRequests, install.flags.flat);
+  const {requests: depRequests, patterns} = await install.fetchRequestFromCwd();
+  await install.resolver.init(depRequests, {isFlat: install.flags.flat, isFrozen: install.flags.frozenLockfile});
   const hoisted = await install.linker.getFlatHoistedTree(patterns);
 
   // finding
@@ -159,7 +175,7 @@ export async function run(
     let delegator = parentRequest;
     do {
       chain.push(install.resolver.getStrictResolvedPattern(delegator.pattern).name);
-    } while (delegator = delegator.parentRequest);
+    } while ((delegator = delegator.parentRequest));
 
     reasons.push({
       type: 'whyDependedOn',
@@ -223,9 +239,7 @@ export async function run(
     reporter.info(reporter.lang(reasons[0].typeSimple, reasons[0].value));
   } else if (reasons.length > 1) {
     reporter.info(reporter.lang('whyReasons'));
-    reporter.list('reasons', reasons.map(
-      (reason) => reporter.lang(reason.type, reason.value)),
-    );
+    reporter.list('reasons', reasons.map(reason => reporter.lang(reason.type, reason.value)));
   } else {
     reporter.error(reporter.lang('whyWhoKnows'));
   }
